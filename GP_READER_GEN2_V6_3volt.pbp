@@ -1,0 +1,875 @@
+'****************************************************************
+'*  Name    : GP_READER_6.3.BAS                                      *
+'*  Author  : [select VIEW...EDITOR OPTIONS]                    *
+'*  Notice  : Copyright (c) 2012 [select VIEW...EDITOR OPTIONS] *
+'*          : All Rights Reserved                               *
+'*  Date    : 2/6/2012                                          *
+'*  Version : 1.0                                               *
+'*  Notes   :                                                   *
+'*          :                                                   *
+'****************************************************************
+
+
+INCLUDE "DT_INTS-18.bas"     ' Base Interrupt System
+INCLUDE "ReEnterPBP-18.bas"     ' Include if using PBP interrupts  
+
+'asm   
+'      __CONFIG    _CONFIG1H, _FOSC_HSHP_1H & _PLLCFG_OFF_1H
+'      __CONFIG    _CONFIG2H, _WDTEN_OFF_2H
+'      __CONFIG    _CONFIG3H, _PBADEN_OFF_3H & _MCLRE_INTMCLR_3H
+'      __CONFIG    _CONFIG4L, _LVP_OFF_4L & _XINST_OFF_4L
+'endasm
+
+#CONFIG   
+      CONFIG FOSC =HSHP
+      CONFIG PLLCFG = OFF
+      CONFIG WDTEN = OFF
+      CONFIG PBADEN = OFF
+      CONFIG MCLRE = INTMCLR
+      CONFIG CCP2MX = PORTB3  
+      CONFIG LVP = OFF
+      CONFIG XINST = OFF
+#ENDCONfig
+
+define LOADER_USED 1
+Define DEBUG_REG PORTC
+DEFINE DEBUG_BIT 6
+DEFINE DEBUG_BAUD 38400
+DEFINE DEBUG_MODE 1
+Define DEBUGIN_REG PORTC
+DEFINE DEBUGIN_BIT 7
+DEFINE DEBUGIN_BAUD 38400
+DEFINE DEBUGIN_MODE 1
+
+ASM   ;set up DT instant interrupt for Timer0
+INT_LIST  macro    ; IntSource,        Label,  Type, ResetFlag?
+        INT_Handler   TMR0_INT,  _TimeRFID,   PBP,  yes
+        INT_Handler   INT0_INT,  _wakeup,     PBP,  yes
+    endm
+    INT_CREATE               ; Creates the interrupt processor
+ENDASM
+
+DEFINE OSC 20
+
+'Alias PIC pins and registers for SD/MMC card
+SD_WE		Var	PORTC.1	' SD card write protect
+SD_WE_TRIS	Var	TRISC.1	' SD card write protect direction
+SDI	    	Var	PORTC.4	' SPI data in
+SDI_TRIS	Var	TRISC.4	' SPI data in direction
+SCL		    Var	PORTC.3	' SPI clock
+SCL_TRIS	Var	TRISC.3	' SPI clock direction
+SD_CS		Var	PORTC.2	' SD card chip select
+SD_CS_TRIS	Var	TRISC.2	' SD card chip select direction
+SD_CD		Var	PORTC.0	' SD card detect
+SD_CD_TRIS	Var	TRISC.0	' SD card detect direction
+SDO		    Var	PORTC.5	' SPI data out
+SDO_TRIS	Var	TRISC.5	' SPI data out direction
+'Alias other pins
+I2CSDA      VAR PORTA.0
+I2CSCL      var PORTA.1
+TX1         var PORTC.6 'Serial transmit
+RX1         var PORTC.7 'Serial receive
+RFIDON      var PORTA.4
+RFIDIN      var PORTA.3
+INT         var PORTB.0 'CLOCK INTERRUPT
+Batv        var PORTA.5 'battery voltage
+LED         var PORTB.1 'LED indicator (turn on SD card)
+
+' Include the SD/MMC subroutines (found in http://melabs.com/resources/samples/pbp/sdfs3.zip)
+	Include "SDFS_RFID.PBP"
+	SDC_UseHardSPI = TRUE	' Use hardware SSP port for SPI.
+
+'Define variables
+B0          VAR     BYTE 'general use
+B1          VAR     BYTE 'general use
+B2          VAR     BYTE 'general use
+B3          VAR     BYTE 'general use
+B4          vAR     bYTE 'general use
+B5          vAR     bYTE 'general use
+B6          vAR     bYTE 'general use
+W0          VAR     Word 'general use
+W1          VAR     Word 'general use
+W2          VAR     Word 'general use
+W3          VAR     Word 'general use
+W4          VAR     Word 'general use
+L0          var     long 'general use
+L1          var     long 'general use
+totalspace  var     long 'for calculating card space   
+usedspace   var     long 'for calculating card space
+availspace  var     long 'for calculating card space
+cycletime   VAR     WORD
+pausetime   VAR     WORD 'polltime entry
+polltime    vAR     wORD 'units of 1 ms
+tcount      var     byte
+pollcount   var     byte 'counts ticks during RFID polling
+preload     var     word
+delaytime   var     WORD 'delay between repeat reads
+curtime     VAR     long 'current time (16bits)
+pasttime    VAR     long 'time when last tag was read
+batt        VAR     byte
+battmin     var     byte 'battery threshold
+LEDon       var     byte 'determines whether LED is used
+ADCVAL      VAR     BYTE 'For storing ADC values
+RTC         VAR     BYTE[6]
+    'RTC variaibles for clock:
+    'RTC[0] = month
+    'RTC[1] = date
+    'RTC[2] = year
+    'RTC[3] = hours
+    'RTC[4] = minutes
+    'RTC[5] = seconds
+TIMETXT        VAR     BYTE[18] 'time stamp in ASCII format
+'SETTEXT     var     byte[140]
+RDRID       var     byte[4] 'RFID reader ID
+RFID        VAR     BYTE[5] 'stored RFID codes
+pastRFID    VAR     BYTE[5] 'last RFID code logged
+timeon      var     word[3] 'stores three on times (hour:minute)
+timeoff     var     word[3] 'stores three off times (hour:minute)
+ontime      VAR     word 'for setting wake alarm
+offtime     vAR     word
+X1 VAR BIT
+ID VAR FAT_src          'share fat source space
+PAR VAR Byte
+battcheck var bit
+
+'constants for tag reading
+pulsemin Con 100 'minimum acceptable pulse duration for tag transmission
+pulsemax con 290 'maximum accptable length of a transmitted pulse
+pauselen con 250 'number of microseconds to pause between bits
+
+
+'Establish EEPROM (interface words and stored settings 
+EEPROM 0, ["GPR0"] 'Reader ID
+eeprom 4, [$99,$99,$99,$99,$99,$99] 'off times (Minute and hour)
+eeprom 10, [$99,$99,$99,$99,$99,$99] 'on times
+eeprom 16, [%11110100, 1] 'polltime (initially 500ms)
+'eeprom 18, [%11101000, %00000011] 'cycletime (initially 1000ms)
+eeprom 18, [%11010000, %00000111] 'cycletime (initially 2000ms)
+eeprom 20, [10,0]         'delaytime (initially 10s)
+eeprom 22, [80]           'battery threshold voltage
+eeprom 24, [1]            'LEDon setting
+eeprom 50, ["ON"] 'for sending text
+eeprom 52, ["OFF"]
+eeprom 55, ["LOGGING STARTED: "]
+eeprom 72, ["LOGGING PAUSED: "]
+eeprom 89, ["LOW BATTERY SHUTDOWN: "]
+'eeprom 111 
+
+' Set fuse registers
+VREFCON1.7 = 0 'disable the DAC (Digital to analog converter)
+VREFCON0 = 0 'disable internal voltage reference
+ANSELA = 0
+ANSELB = 0
+ANSELC = 0  
+ADCON1 = 15		' All I/O pins digital
+PORTA = 0
+PORTB = 0
+PORTC = 0
+TRISA = 0
+TRISB = %00000001 'INPUT ON INTERRUPT PIN
+TRISC = %11001011 'Inputs and outputs
+
+input PORTC.1
+input PORTC.0
+input PORTB.0 
+
+
+MAIN:
+High LED
+PAUSE 10
+Gosub newline
+'PAUSE 100 'power up card?
+debug 10, 13, "GENERAL PURPOSE RFID READER (V6.2)", 10, 13 
+read 0, ID[0], ID[1], ID[2], ID[3]                                                                
+debug "Reader ID: ", str ID\4, 13, "Date & time: "
+gosub gettime 
+gosub timeout
+gosub battery
+B1 = batt/10
+B2 = batt//10
+read 22, battmin
+B3 = battmin/10
+read 24, LEDon
+IF LEDon = 1 then
+    B4 = "N" : B5 = " "
+else
+    B4 = "F": B5 = "F"
+endif
+debug "Battery level: ", dec B1, ".", dec B2, "V", 32, "Battery threshold: ", dec B3, "V", 13,_
+      "LED heartbeat: O", B4, B5, 13 
+read 16, word polltime, word cycletime, word delaytime
+debug "Poll time: ", dec polltime, 32, 32, "Cycle time: ", dec cycletime, 32, 13, "Delay time: ", dec delaytime, 13 
+for B0 = 1 to 3
+    debug "OFF", dec B0,  rep "-"\3, ">ON", DEC B0, rep 32\5
+next B0
+    debug 13
+read 4, word timeoff[0], word timeoff[1], word timeoff[2], word timeon[0], word timeon[1], word timeon[2]      
+for B0 = 0 to 2
+    W0 = timeoff[B0]
+    W1 = timeon[B0]
+    debug hex2 W0.Byte1, 58, hex2 W0.byte0, rep 32\5, hex2 W1.byte1, 58, hex2 W1.byte0, rep 32\5
+next B0
+'calculate preload and pollcount
+L1 = polltime * 20 'number of timer ticks
+preload = L1 // 65535 'preload is based on the remainder 
+preload = 65535 - preload
+pollcount = L1 / 65535 'how many timer loops to count   
+'debug 13, "preload = ", DEC preload, 32, dec preload.byte0, 32, dec preload.byte1, "  pollcount = ", dec pollcount, 10
+gosub newline
+
+checkcard:
+PAUSE 10
+IF (SD_CD = 1) or (SD_WE = 1) then
+    debug "SD card missing or write-protected", 13
+    goto MENU
+endif
+Gosub FSInit	' FSInit initializes the card and reads all the preliminary information from it
+If (FAT_error != 0) Then 
+   debug "!!! SD card error: ", dec FAT_error, " !!!", 13 
+   goto MENU
+endif
+Totalspace = DISK_BytesPerSec * FAT_TotSec
+B0 = "D"        'designate file name for data file 
+gosub setname   'set the file name 
+gosub accessfile
+B0 = "N"
+gosub setname   'set the file name 
+gosub accessfile
+Usedspace = 0
+FAT_error = 0    	
+Gosub FINDfirst		' go through card directory, Find first file on card
+	While (FAT_error = 0)
+		FAT_mode = "r"
+        gosub FSfopen
+        'debug Str FAT_FileName\11, 32, "file size is: ", dec FILE_size, $d, $a 
+		Usedspace = Usedspace + FILE_size
+        gosub FSfclose
+        Gosub FINDnext	' Find next file on card	
+    Wend 
+debug "card size: ", dec Totalspace, " bytes", 13
+L0 = Totalspace >> 5   
+B1 = Usedspace / L0
+B2 = 32 - B1
+debug "[", rep "|"\B1, rep "."\B2, "]", 13
+debug "used space: ", dec Usedspace, " bytes", 13         
+availspace = Totalspace - Usedspace
+L0 = availspace / 30 'Divide space available by 30 bytes per data line
+debug "approx logging capacity: ", dec L0, " data lines"
+low LED 'turn off LED
+
+
+
+MENU:
+debug 10, 13, "Your wish is my command:", 13, "s = settings", 13, "l = log data", 13, "m = memory access", 13, "r = read tag", 13
+debugin 15000, logdata, [B0]
+Select case B0
+    case "s", "S" 
+        debug 10, 13, "Change settings?", 10, 13,_
+        "b = battery threshold", 13,_
+        "c = set clock", 13,_
+        "i = set reader ID", 13,_
+        "l = logging parameters", 13,_
+        "o = off - on schedule", 13
+        Debugin [B1]
+        if B1 < 97 then B1 = B1 + 32                                                                 
+        if B1 = "b" then 
+            entbatt:
+            debug "Enter battery threshold (00-12).", 13
+            Debugin [dec B2]
+            IF B2 > 12 then entbatt  
+            battmin = B2*10
+            write 22, battmin
+        endif 
+        IF B1 = "c" then
+            gosub setclock
+            goto Main
+        endif
+       IF B1 = "l" then
+            setlogparams:
+            debug 10, 13, "Enter Poll time in ms", 13
+            Debugin [dec Polltime]
+            IF (Polltime < 100) then 
+                debug 10, 13, "value too low", 10, 13
+                goto setlogparams: 
+            endif
+            debug 10, 13, "Enter cycle time in ms", 13
+            Debugin [dec Cycletime] 
+            if polltime > Cycletime then 
+                debug "Poll time cannot exceed cycle time!", 13
+                goto setlogparams
+            endif
+            if Cycletime > 58000 then 
+                debug "Cycle may exceed 1 minute. No can do...", 13
+                goto setlogparams
+            endif
+            W0 = Cycletime - polltime
+            L0 = Cycletime + polltime
+            if (L0 < 200) or (W0 < 100) then 
+                debug "Need a longer cycle or shorter poll time.", 13
+                goto setlogparams
+            endif
+            debug 10, 13, "Enter Delay time in s", 13
+            Debugin [dec delaytime]
+            debug 10, 13, "LED heartbeat on (1) or off (0)", 13
+            Debugin [dec LEDon]
+            IF LEDon > 1 then LEDon = 1
+            write 16, WORD polltime, WORD cycletime, word delaytime                                                               
+            write 24, LEDon
+            Goto Main
+        endif
+        IF B1 = "o" then
+            FOR B1 = 0 to 2
+                B2 = B1 + 1
+                debug "Off-time #", dec B2, ": Enter HHMM", 13
+                debugin 15000, Main, [hex2 W0.byte1, hex2 W0.byte0]
+                'debugin 15000, Main, [hex4 W0]
+                timeoff[B1] = W0
+                debug "You entered ",  hex2 W0.byte1, ":", hex2 W0.byte0, 13 'byte 1 = hour, byte 2 = minute
+                debug "On-time #", dec B2, ": Enter HHMM", 13
+                debugin 15000, Main, [hex2 W0.byte1, hex2 W0.byte0]
+                timeon[B1] = W0
+                debug "You entered ",  hex2 W0.byte1, ":", hex2 W0.byte0, 13
+                write 4, word timeoff[0],word timeoff[1], word timeoff[2], word timeon[0],word timeon[1], word timeon[2]
+            next B1
+        endif
+        if B1 = "i" then
+              debug "Enter 4 characters", 13
+              debugin 15000, Main, [str ID\4]
+              WRITE 0, ID[0], ID[1], ID[2], ID[3]   
+        endif 
+        goto Main
+    case "l", "L" 
+        goto logdata
+    case "r", "R" 
+        polltime = 10000 'set poll time for 10 seconds
+        gosub gettag
+        gosub tagout
+        read 16, word polltime 'restore saved poll time                             y
+        goto MAIN
+    case "m"
+        debug "d = upload data file", 13, "n = upload notes file", 13, "b = upload both", 13, "x = clear files", 13
+        Debugin [B0] 
+            IF (B0 = "x") or (B0 = "X") then clearit
+            dumpit:
+            gosub setname
+            gosub readdata
+            if (B0 = "B") or (B0 = "b") then 
+                B0 = "d"
+                goto dumpit
+            endif
+            clearit:
+            debug "Do you want to clear the files? y or n"
+            Debugin [B0]
+            if B0 = "y" then
+                Gosub setname
+                gosub makenewfile
+                B0 = "D" 'designate notes file
+                gosub setname
+                gosub makenewfile
+            endif
+            goto Main
+    case else
+        'debug B0, " is not a valid wish.", 10, 13
+        goto logdata
+end select    
+
+logdata:         'setup for logging data
+battcheck = 0
+gosub gettime
+'B0 = "X"       #check for day specific file
+'gosub setname  #set day specific file name
+'gosub accessfile  #make the file if it does not exist
+pasttime = 99999 'reset pasttime
+B1 = 55 'prepare to write to note file
+gosub prepnote   'prepare note file data
+gosub writedata   'write data to note file
+debug "logging started "
+gosub timeout
+gosub newline
+'set up timer variables
+pausetime = cycletime - polltime
+pausetime = (pausetime*64)/1000
+goto checkbatt   'always check battery on first loop
+
+logloop:
+gosub gettime
+IF RTC[4] <> 0 then checksleep 'check battery once every hour
+checkbatt:
+   gosub battery    'check battery
+   IF batt > battmin then 
+    if battcheck = 1 then logdata
+    battcheck = 0
+    goto checksleep
+   endif
+   Pause 100
+   IF batt > battmin then 
+    if battcheck = 1 then logdata
+    battcheck = 0
+    goto checksleep
+   endif
+   B1 = 89 'write to note file
+   if battcheck = 0 then
+    gosub prepnote   'prepare note file data
+    gosub writedata   'write data to note file
+   endif
+   'set timer to check battery every ?? 10 minutes? or turn alarm off?
+   W0 = 10 'calculate number of timer periods
+   B1 = %01010011   'minutes
+   'B1 = %01010010   'seconds (last two bits define timer units)
+   'B1 = %01010001    '15.625 ms (64 hz)
+   gosub settimer   'set up timer
+   gosub sleepit  'go to sleep and wait for alarm or restart.
+   battcheck = 1
+   goto checkbatt
+    
+checksleep: 'check to see if it is time for a sleep period
+    W0.byte1 = RTC[3]  'load hour and minute into W0
+    W0.byte0 = RTC[4]
+    FOR B4 = 0 to 2
+        'debug hex4 W0, 32, hex4 timeoff[B0], 13
+        IF W0 = timeoff[B4] then
+           B1 = 72 'write to note file
+           gosub prepnote   'prepare note file data
+           gosub writedata   'write data to note file
+           debug "Logging paused: "
+           gosub timeout
+           ontime = timeon[B4] 'load the proper on time
+           gosub setalarm    'set a wake-up alarm for the on time
+           gosub sleepit
+           goto logdata
+        endif
+        IF W0 = 0 then pasttime = 99999 'reset pasttime every midnight
+        next B4
+
+'Now poll for tags and log data
+'debug "check for tags", 10, 13
+gosub gettag
+Pause 3
+gosub tagout
+for B0 = 0 to 4
+    IF RFID[B0] <> $FF then checkit 
+next B0                  
+goto sleepinit 'tag not found, go to sleep
+goto logloop
+
+checkit: 'Tag was found, check if it was the same as the last one
+    gosub flashit
+    FOR B1 = 3 to 5  'convert hex to decimal
+    	TIMETXT[B1] = RTC[B1] - ((RTC[B1]/16)*6)
+    NEXT B1
+    curtime = TIMETXT[3]*3600 + TIMETXT[4]*60 + TIMETXT[5] 'calculate current time in seconds
+    for B0 = 0 to 4
+        IF RFID[B0] <> PASTRFID[B0] then logit
+    next B0                                       
+    IF curtime < pasttime then logit 
+    L0 = curtime - pasttime
+    IF L0 <= delaytime then 
+       gosub sleepit 'if the difference between current time and past time is below threshold then don't log data
+       goto logloop
+    endif
+
+logit: 'Log the tag number and time
+    'debug "logit", 32, str FAT_filename\11, 32, str ID\4, 13
+    B0 = "D"
+    gosub setname
+    arraywrite FAT_src, [hex2 RFID[4], hex2 RFID[3], hex2 RFID[2], hex2 RFID[1], hex2 RFID[0]] 
+    FAT_count = 10
+    gosub loadtime
+    gosub writedata
+'    B0 = "X"  'Write to backup.
+'    gosub setname
+'    gosub writedata
+    pasttime = curtime
+    for B0 = 0 to 4    'set new past RFID
+        pastRFID[B0] = RFID[B0]
+    next B0
+sleepinit:
+    W0 = pausetime - 1 'number of timer periods minus 1 for code execution
+    'B1 = %01010011   'minutes
+    'B1 = %01010010   'seconds (last two bits define timer units)
+    B1 = %01010001    '15.625 ms (64 hz)
+    'debug "sleep ", dec W0
+    gosub settimer   'set up timer
+    gosub sleepit
+    goto logloop
+    
+sleepit:
+    
+    low Batv
+    low LED
+    @ INT_ENABLE  INT0_INT
+    INTCON2.6 = 0 'set interrupt for falling edge 
+    @SLEEP 
+    @NOP                'sleep until alarm
+    @ INT_DISABLE  INT0_INT
+return
+    
+'SIMPLE GOSUBS__________________________________________________________________________
+
+flashit:
+    for B1 = 0 to 2
+        high LED
+        pause 10
+        low LED
+        if B1 = 2 then exitflash 
+        pause 200
+    next B1
+    exitflash:
+    return
+'______________________________________________________________________________________
+battery:
+ADCON0 = %00010001
+ADCON1 = 0
+INPUT Batv 
+ANSELA = %00100000 'select portA5 (AN4) for analog input
+ADCin 4, B0
+'gosub newline
+'debug dec b0
+'gosub newline
+batt = (B0*64)/100 + 9
+return
+
+'__________________________________________________________________________
+
+gettime:
+    B2 = 0
+    I2Cread I2CSDA, I2CSCL, $A2, B2, [RTC[5], RTC[4], RTC[3], B0, RTC[1], RTC[0], RTC[2]]
+    PAUSE 10
+return
+
+'_____________________________________________________________________________
+
+setclock: 'set clock time
+debug "Enter MMDDYYHHMMSS", 10, 13
+debugin 15000, Main, [hex RTC[0], hex RTC[1], hex RTC[2], hex RTC[3], hex RTC[4], hex RTC[5]]
+debug "you entered ", hex RTC[0], "/", hex RTC[1], "/", hex RTC[2], 32, hex RTC[3], ":", hex RTC[4], ":", hex RTC[5], 10, 13
+settime:
+    B2 = $0F    
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [0] 'interrupts stopped.
+    PAUSE 10
+    B2 = 0
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [RTC[5], RTC[4], RTC[3], 3, RTC[1], RTC[0], RTC[2], 128]
+    PAUSE 10
+return
+
+'__________________________________________________________________________
+
+timeout:    
+    debug hex2 RTC[0], "/", hex2 RTC[1], "/", hex2 RTC[2], 32, hex2 RTC[3], ":", hex2 RTC[4], ":", hex2 RTC[5], 13
+    PAUSE 10
+return  
+'__________________________________________________________________________
+
+ eepromout:
+ For B2 = B0 to B1
+    read B0, B1
+    debug B1
+ next B2
+ return
+
+'__________________________________________________________________________
+
+setalarm:
+    B2 = $0F    
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [0] 'interrupts stopped.
+    PAUSE 10
+    B2 = $08 'select minute alarm register
+    B0 = ontime.byte0        'minute
+    B1 = ontime.byte1        'hour
+    'debug ontime, 32, hex4 ontime, 13
+    'debug "setting alarm to ", hex2 B1, 58, hex2 B0
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [B0, B1, %10000000] 'set minute, hour, and AE (BIT7 = 1 = ignore)
+    PAUSE 10
+    B2 = $0D 'select extension, flag, and control registers
+    B0 = %0110010 'extension settings
+    B1 = %00001000 'turn on alarm interrupt. all others off
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [B0, 0 ,B1]
+    pause 10
+return
+
+'__________________________________________________________________________
+
+settimer:                                               
+    B2 = $0F    
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [0] 'interrupts stopped.
+    PAUSE 10
+    B2 = $0B
+    I2CWrite I2CSDA, I2CSCL, $A2, B2, [W0.byte0, W0.byte1, B1, 0, %00010000] 'set timer and turn timer interrupts on
+    PAUSE 10
+return                                                                     
+
+'_________________________________________________________________________
+
+newline:
+    debug 10, 13
+rETURN
+
+'_________________________________________________________________________
+
+tagout:
+    FOR B3 = 4 to 0 STEP -1
+        debug HEX2 RFID[B3]
+    next B3
+    gosub newline
+rETURN
+
+
+'SD CARD OPERATIONS
+
+setname: 'establish the FAT-filename base on READER ID
+    'debug "setname1", 32, str FAT_filename\11, 32, str ID\4, 13
+    read 0, ID[0], ID[1], ID[2], ID[3]  'read in the ID
+    IF (B0 = "D") or (B0 = "d") then arraywrite FAT_FileName, [ID[0], ID[1], ID[2], ID[3], "DATATXT"] 
+    IF (B0 = "N") or (B0 = "n") then arraywrite FAT_FileName, [ID[0], ID[1], ID[2], ID[3], "NOTETXT"] 	
+    'IF (B0 = "X") or (B0 = "x") then arraywrite FAT_FileName, [ID[0], ID[1], ID[2], ID[3], HEX2 RTC[0],hex2 RTC[1], "TXT"] 
+    'debug "setname2", 32, str FAT_filename\11, 32, str ID\4, 13
+ return
+
+accessfile:
+'    debug "looking for ", str FAT_filename\11, 13
+    FAT_mode = "r"
+    Gosub FSfopen		' Open file pointed to by Byte array FAT_FileName
+    'debug "Open for read: ", Dec FAT_error, $d, $a
+    If (FAT_error != 0) Then   
+        debug "making new file: ", str FAT_Filename\8,  13
+        gosub makenewfile
+    endif
+    'debug "file found, size = ", dec File_size, 13
+    gosub FSfclose
+    gosub carderror
+return
+
+makenewfile:
+'set FAT time for file creation
+  FAT_seconds = RTC[5] - ((RTC[5]/16)*6) 'seconds
+  FAT_minutes = RTC[4] - ((rTC[4]/16)*6) 'minutes
+  FAT_hours = RTC[3] - ((rTC[3]/16)*6) 'hours
+  FAT_year = RTC[2] - ((rTC[2]/16)*6) 'year
+  FAT_day = RTC[1] - ((rTC[1]/16)*6) 'day
+  FAT_month = RTC[0] - ((rTC[0]/16)*6) 'month
+                        
+    pause 10
+    'DEBUG "MAKING FILE: ", str FAT_filename\11, 13
+    FAT_mode = "w"
+    Gosub FSfopen		' Open file pointed to by Byte array FAT_FileName
+	'debug "Open for write: ", Dec FAT_error, $d, $a
+	If (FAT_error != 0) Then Stop		' Open file pointed to by Byte array FAT_FileName
+'  write file
+    FOR B1 = 0 to 7
+    FAT_src[B1] = FAT_filename[B1]
+    next B1
+    'DEBUG "WRITING: ", FAT_src[0], FAT_src[1], FAT_src[2], FAT_src[3], FAT_src[4], FAT_src[5], FAT_src[6], FAT_src[7], 13
+   	FAT_src[8] = 13 'carriage return at line's end
+    FAT_mode = "w"
+    FAT_count = 9    '8 characters and one line return.   
+   	Gosub FSfwrite
+	'debug "Write ", Dec FAT_error, $d, $a
+	If (FAT_error != 0) Then Stop
+' Close file
+	Gosub FSfclose
+	'debug "Close ", Dec FAT_error, $d, $a
+	If (FAT_error != 0) Then Stop
+
+return
+
+prepnote:
+B0 = "N" 'designate note file
+gosub setname 'set file name to XXXXNOTETXT 
+'DEBUG str FAT_filename\11, 13      
+FAT_count = 0    'set to zero to start data loading loop
+Repeat
+	B0 = B1 + FAT_count 'B1 is defined before the gosub
+    read B0, B2  
+    FAT_src[FAT_count] = B2
+	FAT_count = FAT_count + 1
+until B2 = ":"
+'      gosub newline
+    'debug str FAT_src\18, 32, dec FAT_count, 32, 32, 13
+gosub loadtime
+    'debug str FAT_src\60, 32, 32, "FAT_count = ", dec FAT_count, 13
+if (B1 = 55) then gosub loadsettings
+    FAT_src[FAT_count] = 13 'end of line
+    FAT_count = FAT_count + 1
+return 
+
+writedata:
+    'debug "writedata", 32, str FAT_filename\11, 32, str ID\4, 13
+    pause 10
+    Gosub FSInit	' FSInit initializes the card and reads all the preliminary information from it
+    gosub carderror
+'    debug "init ", Dec FAT_error, $d, $a	
+' Open a file for append
+    FAT_mode = "a"		' Append mode
+    Gosub FSfopen		' Open file pointed to by Byte array FAT_FileName
+	gosub carderror
+    'debug "Open for append: ", str FAT_filename\11, 32, Dec FAT_error, $d, $a
+    'debug "writing: ", str FAT_src\FAT_count
+    Gosub FSfwrite
+    gosub carderror
+'	debug "Write ", Dec FAT_error, $d, $a
+	'If (FAT_error != 0) Then Stop
+' Close file
+	Gosub FSfclose
+'	debug "Close ", Dec FAT_error, $d, $a
+	gosub carderror
+return
+
+loadtime: 'transform clock data into ascii and load into FAT_src
+'gosub gettime 
+arraywrite FAT_src, [STR FAT_src\FAT_count, 32, HEX2 RTC[0], 47 , hex2 RTC[1], 47, hex2 RTC[2], 32, hex2 RTC[3], 58, hex2 RTC[4], 58, hex2 RTC[5], 13]
+'debug str TIMETXT\18, 32, dec FAT_count, 13
+FAT_count = FAT_count + 19
+return
+
+
+loadsettings: 
+B3 = batt/10
+B4 = batt//10
+B5 = battmin/10
+arraywrite FAT_src, [STR FAT_src\FAT_count, 32, "Bat_lvl:", dec2 B3, ".", dec1 B4, 32, "Bat_thresh:", dec2 B5, 32,_                              
+      "LED:", dec1 ledon, 32, "Poll_time:", dec5 polltime, 32, "Cycle_time:", dec5 cycletime,_                         
+       32, "Delay_time:", dec5 delaytime, 32, "off1:", hex4 timeoff[0], 32, "off2:", hex4 timeoff[1],_                 
+       32, "off3:", hex4 timeoff[2], 32, "on1:", hex4 timeon[0], 32, "on2:", hex4 timeon[1], 32, "on3:", hex4 timeon[2]] 
+FAT_count = FAT_count + 140
+return
+
+
+readdata: ' Open a file for read
+    gosub accessfile
+    gosub carderror
+' Read and display the whole file
+	While (FAT_error = 0)
+		FAT_count = 255	' Read 1 byte to buffer at a time
+		Gosub FSfread
+		debug str FAT_dest\FAT_rwCount
+	Wend
+'	debug "File size: ", dec FILE_size, 32, Dec FAT_error, $d, $a
+return
+
+carderror:
+    If (FAT_error != 0) Then 
+       debug "SD card error: ", Dec FAT_error, $d, $a
+    endif
+return
+
+'TAG READING 
+
+gettag:
+output LED
+LED = LEDon
+'testing:
+'    input RFIDIN
+'    HIGH RFIDON 'Sets U2270B standby pin to high
+'    PAUSE 50 'pause to let antenna coil power up.
+
+'    for w2 = 0 TO 100 'GET A FEW HIGH AND LOW PULSE LENGTHS
+'        PULSIN RFIDIN, 0, W1 'look for a low pulse
+'        debug dec w1, 32
+'    next w2
+'    gOsUB newline
+    
+'    for w2 = 0 TO 100    
+'        PULSIN RFIDIN, 1, W1 'look for a low puls
+'        debug dec w1, 32
+'    Next w2    
+'    gosUB newline
+
+'debug "getting tag...."
+T0CON.6 = 0 '16 bit counter selected
+tcount = 0
+TMR0H = preload.byte1
+TMR0L = preload.byte0 'pre-load timer
+'debug "start TMR0 = ", dec preload, 32, dec polltime, 13
+T0CON = %10000111           ;prescaler at 1:256
+@ INT_ENABLE  TMR0_INT     ; enable Timer 0 interrupt - Start timing the polling period
+input RFIDIN
+HIGH RFIDON 'Sets U2270B standby pin to high
+FOR B1 = 4 to 0 STEP -1 'set RFID array to $FFFFFFFFFF
+    RFID[B1] = $FF      'designates no tag read
+NEXT B1
+PAUSE 8 'pause to let antenna coil power up.
+low LED 'indicator off 
+
+search:
+    'debug " search "
+    if tcount > pollcount then exitRFID 
+    ID.0 = RFIDIN
+    rctime RFIDIN, 0, W1 'look for a long pulse
+    IF (W1 < pulsemin) OR (W1 > pulsemax) THEN search 'pulses out of range are noise.
+        
+'The following loop reads bits, waits for nine 1's and then stores
+'the data in ID byte array.
+    'SEROUT2 SDOUT,16468,["READING"]
+    B3 =  0 'This byte counts the number of ones read initially
+    FOR B1 = 54 to 0 STEP -1 
+        startRFID:
+        PAUSEUS pauselen 'pause to enter the pre-transition phase of next bit   
+        ID.0(B1) = RFIDIN 'save state of RFIDIN pin to ID array
+                          'note that the state of the RFID pin at 
+                          'the pretransition phase corresponds to the
+                          'actual value of the bit (0 to 1 = 0 and 1 
+                          'to 0 = 1).        
+        While ID.0(B1) = RFIDIN
+            PAUSEUS 12
+            if tcount > pollcount then exitRFID   'Exit If no transition
+        wend  'exit loop
+        IF B3 < 9 tHEn  'Count consectuve 1's if needed
+            if tcount > pollcount then exitRFID  'Exit If nine 1's are not read
+            B3 = (B3 + 1) * ID.0(b1) 'Add to B3 if 1 was read; set B3 to zero if 0 was read
+            GOTO startRFID 'B1 does not advance until after nine '1's are read
+        else
+            pauseus 40 'pause to equalize the execution of the two IF options
+        ENDIF
+    NEXT B1 
+Paritycheck:
+'Every 5th bit is a row parity bit for the previous four
+'Bits 4 through 1 are column parity bits for four columns.
+    PAR = 0 'parity storage
+    FOR B0 = 54 to 5 step -5        'steps through each row
+        B1 = B0 - 4           '     designates parity bit in each row
+        FOR B2 = 0 to 3             'steps through four bits in each row
+            B3 = B0 - B2            'counts from high bit to low bit in each row
+            B4 = 3 - B2
+            PAR.4 = PAR.4 + ID.0(B3) 'sum for the rows
+            PAR.0(B4) = PAR.0(B4) + ID.0(B3)
+        next B2
+            IF PAR.4 <> ID.0(B1) then search 'checks each row
+            PAR.4 = 0 'reset test bit  
+     next B0
+     for B0 = 0 to 3 'check column parity
+        B1 = B0 + 1
+        if PAR.0(B0) <> ID.0(B1) then search
+     next B0
+'parity check passed - write ID to RFID
+    B1 = 0
+For B0 = 6 to 54 'bit six is the first actual data bit
+    B2 = B0 // 5
+    if B2 = 0 THEN skipit 'skip every fifth bit (parity bits)
+    RFID.0(B1) = ID.0(B0)
+    B1 = B1 + 1
+    skipit:
+next B0
+ 
+exitRFID:
+    @ INT_DISABLE  TMR0_INT     ; disable Timer 0 interrupts
+    T0CON.7 = 0                 'turn off timer
+    LOW RFIDON                  'put reader in standby mode
+    if tcount > pollcount then 
+         FOR B1 = 4 to 0 STEP -1 'set RFID array to $FFFFFFFFFF
+            RFID[B1] = $FF      'designates no tag read
+         NEXT B1
+    endif
+    'debug "done", 10, 13
+RETURN      
+
+'INTERRUPT HANDLERS
+	
+TimeRFID:
+    tcount = tcount + 1
+    'debug dec tcount, 32, dec pollcount, 13
+@ INT_RETURN
+
+wakeup:
+@NOP
+@ INT_RETURN
+

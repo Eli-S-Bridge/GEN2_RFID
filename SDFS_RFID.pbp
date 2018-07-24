@@ -1,0 +1,2076 @@
+' PICBASIC PRO 2.50L subroutines to talk to MMC/SD cards with PIC18
+'  03/11/09
+
+'	Define	OSC	20	' 20 MHz oscillator
+
+' Alias PIC pins and registers
+'SD_WE		Var	PORTA.4	' SD card write protect
+'SD_WE_TRIS	Var	TRISA.4	' SD card write protect direction
+'SDI		Var	PORTB.0	' SPI data in
+'SDI_TRIS	Var	TRISB.0	' SPI data in direction
+'SCL		Var	PORTB.1	' SPI clock
+'SCL_TRIS	Var	TRISB.1	' SPI clock direction
+'SD_CS		Var	PORTB.3	' SD card chip select
+'SD_CS_TRIS	Var	TRISB.3	' SD card chip select direction
+'SD_CD		Var	PORTB.4	' SD card detect
+'SD_CD_TRIS	Var	TRISB.4	' SD card detect direction
+'SDO		Var	PORTC.7	' SPI data out
+'SDO_TRIS	Var	TRISC.7	' SPI data out direction
+SSPEN		Var	SSP1CON1.5	' SSP enable
+WCOL		Var	SSP1CON1.7	' SSP write collision
+BF		    Var	SSP1STAT.0	' SSP buffer full
+SSP1IF		Var	PIR1.3		' SSP interrupt flag
+
+' Define constants used by SD card subroutines
+MEDIA_SECTOR_SIZE Con	512
+
+' Indexes into command table
+GO_IDLE_STATE	Con	0
+SEND_OP_COND	Con	1
+SET_BLOCKLEN	Con	2
+READ_SINGLE_BLOCK Con	3
+WRITE_SINGLE_BLOCK Con	4
+CRC_ON_OFF	Con	5
+
+NODATA		Con	0
+MOREDATA	Con	1
+
+DATA_START_TOKEN Con	$fe
+DATA_ACCEPTED	Con	$05
+SDC_FLOATING_BUS Con	$ff
+SDC_BAD_RESPONSE Con	SDC_FLOATING_BUS
+
+sdcValid	Con	0
+sdcCardInitCommFailure Con 1
+sdcCardNotInitFailure Con 2
+sdcCardInitTimeout Con	3
+'sdcCardTypeInvalid Con	4
+sdcCardBadCmd	Con	5
+sdcCardTimeout	Con	6
+'sdcCardCRCError	Con	7
+sdcCardDataRejected Con	8
+'sdcEraseTimedOut Con	9
+
+' Create variables used by SD card subroutines
+SDC_address	Var	Long
+SDC_buffer	Var	Byte[MEDIA_SECTOR_SIZE]
+SDC_cmd		Var	Byte
+SDC_CmdCode	Var	Byte
+SDC_CRC		Var	Byte
+SDC_data_in	Var	Byte
+SDC_data_out	Var	Byte
+SDC_index	Var	Word
+SDC_moredataexpected Var Byte
+SDC_response	Var	Byte
+SDC_sector_addr	Var	Long
+SDC_status	Var	Byte
+SDC_timeout	Var	Long
+SDC_timeout1	Var	Word
+SDC_UseHardSPI	Var	Byte
+
+' Create constants and variables used by the FAT subroutines
+FAT_BUFFER_SIZE	Con	MEDIA_SECTOR_SIZE
+
+CE_GOOD		Con	0	' No error
+CE_ERASE_FAIL	Con	1	' An erase failed
+CE_NOT_PRESENT	Con	2	' No device was present
+CE_NOT_FORMATTED Con	3	' The disk is of an unsupported format
+CE_BAD_PARTITION Con	4	' The boot record is bad
+CE_UNSUPPORTED_FS Con	5	' The file system type is unsupported
+CE_INIT_ERROR	Con	6	' An initialization error has occured
+CE_NOT_INIT	Con	7	' An operation was performed on an uninitialized device
+CE_BAD_SECTOR_READ Con	8	' A bad read of a sector occured
+CE_WRITE_ERROR	Con	9	' Could not write to a sector
+CE_INVALID_CLUSTER Con	10	' Invalid cluster value > maxcls
+CE_FILE_NOT_FOUND Con	11	' Could not find the file on the device
+CE_DIR_NOT_FOUND Con	12	' Could not find the directory
+CE_BAD_FILE	Con	13	' File is corrupted
+CE_DONE		Con	14	' No more files in this directory
+CE_COULD_NOT_GET_CLUSTER Con 15	' Could not load/allocate next cluster in file
+CE_FILENAME_2_LONG Con	16	' A specified file name is too long to use
+CE_FILENAME_EXISTS Con	17	' A specified filename already exists on the device
+CE_INVALID_FILENAME Con	18	' Invalid file name
+CE_DELETE_DIR	Con	19	' The user tried to delete a directory with FSremove
+CE_DIR_FULL	Con	20	' All root dir entry are taken
+CE_DISK_FULL	Con	21	' All clusters in partition are taken
+CE_DIR_NOT_EMPTY Con	22	' This directory is not empty yet, remove files b4 deleting
+CE_NONSUPPORTED_SIZE Con 23	' The disk is too big to format as FAT16
+CE_WRITE_PROTECTED Con	24	' Card is write protected
+CE_FILENOTOPENED Con	25	' File not opened for the write
+CE_SEEK_ERROR	Con	26	' File location could not be changed successfully
+CE_BADCACHEREAD	Con	27	' Bad cache read
+CE_CARDFAT32	Con	28	' FAT32 - card not supported
+CE_READONLY	Con	29	' The file is read-only
+CE_CARDFAT12	Con	30	' FAT12 - card not supported
+CE_WRITEONLY	Con	31	' The file is write-only
+CE_INVALID_ARGUMENT Con	32	' Invalid argument
+CE_FAT_EOF	Con	60	' Attempt to read beyond the FAT's EOF
+CE_EOF		Con	61	' End of file reached
+DIR_NAMESIZE	Con	8
+DIR_EXTENSIONSIZE Con	3
+FALSE		Con	0
+TRUE		Con	1
+NUMBER_OF_BYTES_IN_DIR_ENTRY Con 32	' 32 bytes per directory entry
+DIRENTRIES_PER_SECTOR Con $10	' A 512-byte sector can hold sixteen 32-byte directory entries.
+ATTR_MASK	Con	$3f
+ATTR_READ_ONLY	Con	$01         
+ATTR_HIDDEN	Con	$02
+ATTR_SYSTEM	Con	$04           
+ATTR_VOLUME	Con	$08
+ATTR_LONG_NAME	Con	$0f
+ATTR_DIRECTORY	Con	$10            
+ATTR_ARCHIVE	Con	$20
+DIR_DEL		Con	$e5	' Deleted entry
+DIR_EMPTY	Con	0	' All entries that follow are empty
+FOUND		Con	0	' Directory entry match
+ERASED		Con	0	' An erase occured correctly
+NOT_FOUND	Con	1	' Directory entry not found
+NO_MORE		Con	2	' No more files found
+WRITE_ERROR	Con	3	' A write error occured
+FAT12		Con	1
+FAT16		Con	2
+FAT32		Con	3
+FILE_NAME_SIZE	Con	11
+CLUSTER_EMPTY	Con	$0000
+CLUSTER_FAIL	Con	$ffff
+END_CLUSTER	Con	$fff7
+LAST_CLUSTER	Con	$fff8
+LAST_CLUSTER_FAT16 Con	$fff8
+
+' DISK variables hold information about a volume and its FAT
+DISK_buffer	Var	SDC_buffer	' Pointer to a general buffer equal to one sector
+DISK_firsts	Var	Long	' LBA of the volume's first sector
+DISK_fat	Var	Long	' LBA of the volume's FAT
+DISK_root	Var	Long	' LBA of the volume's root directory
+DISK_data	Var	Long	' LBA of the volume's data area
+DISK_maxcls	Var	Long	' Maximum number of data clusters in the volume
+DISK_maxroot	Var	Word	' Maximum number of entries in the root directory
+DISK_BytesPerSec Var	Word	' Number of bytes per sector
+DISK_fatsize	Var	Word	' Number of sectors in the FAT
+DISK_fatcopy	Var	Byte	' Number of copies of the FAT
+DISK_SecPerClus	Var	Byte	' Number of sectors per cluster
+DISK_type	Var	Byte	' Type of FAT (FAT16, FAT32)
+DISK_mount	Var	Byte	' TRUE if the media is mounted, FALSE if not mounted
+
+' FILE variables store information about a file, including its location in a volume and a location currently being accessed in the file
+FILE_cluster	Var	Word	' Number of the file's first cluster
+FILE_ccls	Var	Word	' Current cluster
+FILE_sec	Var	Word	' Current sector in the current cluster
+FILE_pos	Var	Word	' Current byte location in the current sector
+FILE_seek	Var	Long	' Current byte location in the file
+FILE_size	Var	Long	' File size
+FILE_Flags_write Var	Bit	' Set if the file was opened for writing
+FILE_Flags_FileWriteEOF Var Bit	' Set if writing and have reached the end of the file
+FILE_time	Var	Word	' Last update time
+FILE_date	Var	Word	' Last update date
+FILE_name	Var	Byte[FILE_NAME_SIZE]	' File name
+FILE_entry	Var	Word	' Position of the file's entry in its directory
+FILE_chk	Var	Word	' FILE structure checksum = ~ (entry + name[0])
+FILE_attributes	Var	Word	' File's attributes
+FILE_dirclus	Var	Word	' First cluster of the file's directory
+FILE_dirccls	Var	Word	' Current cluster of the file's directory
+
+' DIR variables store a directory entry's 32 bytes (must stay in order below for array access)
+DIRL		Var	Long[8]	' Directory entry array Long access
+DIRW		Var	DIRL.Word0	' Directory entry array Word access
+DIRB		Var	DIRL.Byte0	' Directory entry array Byte access
+DIR_Name	Var	DIRB[0]	' Name
+DIR_Extension	Var	DIRB[8]	' Extension
+DIR_Attr	Var	DIRB[11]	' Attributes
+DIR_NTRes	Var	DIRB[12]	' Reserved by NT
+DIR_CrtTimeTenth Var	DIRB[13]	' Time created, tenths of second portion
+DIR_CrtTime	Var	DIRW[7]	' Time created
+DIR_CrtDate	Var	DIRW[8]	' Date created
+DIR_LstAccDate	Var	DIRW[9]	' Last access date
+DIR_FstClusHI	Var	DIRW[10]	' High word of entry's first cluster number
+DIR_WrtTime	Var	DIRW[11]	' Last update time
+DIR_WrtDate	Var	DIRW[12]	' Last update date
+DIR_FstClusLO	Var	DIRW[13]	' Low word of entry's first cluster number
+DIR_FileSize	Var	DIRL[7]	' File size
+
+' Miscellaneous variables used by the FAT subroutines
+FAT_a		Var	Byte
+FAT_c		Var	Word
+FAT_ccls	Var	Word
+FAT_character	Var	Byte
+FAT_cls		Var	Word
+FAT_cluster	Var	Word
+FAT_count	Var	Word
+FAT_FileName	Var	Byte[11]
+FAT_FileName1	Var	Byte[11]
+FAT_FileName2	Var	Byte[11]
+FAT_curEntry	Var	Word
+FAT_day		Var	Byte
+FAT_dest	Var	Byte[FAT_BUFFER_SIZE]	' Source and Destination arrays use same memory locations
+FAT_error	Var	Byte
+FAT_fHandle	Var	Word
+FAT_ForceRead	Var	Byte
+FAT_hours	Var	Byte
+FAT_i		Var	Byte
+FAT_minutes	Var	Byte
+FAT_mode	Var	Byte
+FAT_month	Var	Byte
+FAT_n		Var	Word
+FAT_numofclus	Var	Byte
+FAT_offset	Var	Long
+FAT_offset2	Var	Byte
+FAT_p		Var	Word
+FAT_pos		Var	Word
+FAT_rwCount	Var	Word
+FAT_RootDirSectors Var	Word
+FAT_seconds	Var	Byte
+FAT_sector	Var	Long
+FAT_seek	Var	Long
+FAT_size	Var	Long
+FAT_src		Var	FAT_dest	' Source and Destination arrays use same memory locations
+FAT_status	Var	Byte
+FAT_test	Var	Byte
+FAT_TotSec	Var	Long
+FAT_v		Var	Word
+FAT_year	Var	Byte
+
+
+' Initialize some values for the following subroutines
+	SDC_UseHardSPI = TRUE	' Use hardware SSP port for SPI.
+	DISK_mount = FALSE	' The card has not been initialized.
+	FAT_mode = "r"		' Read mode if not otherwise specified.
+	FAT_count = 0		' Default character count to 0.
+
+' Skip over SD/MMC/FAT subroutines
+	Goto SkipSD
+
+
+' Subroutines for communicating with an SD/MMC card
+' Subroutine to initialize SD card pins
+InitIO:
+	SD_CS = 1		' SD card not selected.
+	SD_CS_TRIS = 0		' Output SD card chip select.
+	SD_CD_TRIS = 1		' Input card detect.
+	SD_WE_TRIS = 1		' Input	write protect.
+	SDO = 1			' Start SPI data out high.
+	SDO_TRIS = 0		' Output SPI data out.
+	SDI_TRIS = 1		' Input SPI data in.
+	SCL = 1			' SPI clock idles high.
+	SCL_TRIS = 0		' Output SPI clock.
+	Return
+
+
+' Subroutine to initialize hardware SSP for SPI at less than 400kHz
+'Changed this!!!!
+OpenSPIM:
+	If (SDC_UseHardSPI) Then
+		SSP1STAT = %00000000	' Sample at middle of data output time, Mode 1, 1: Transmit on idle to active clock transition.
+		SSP1CON1 = %00010010	' SPI master mode, clock = Fosc/64, Mode 1, 1: Clock idle high.
+		SSPEN = 1		' Enable hardware SPI port.
+	Endif
+	Return
+
+
+' Subroutine to initialize hardware SSP for SPI at full speed
+OpenSPIMFast:
+	If (SDC_UseHardSPI) Then
+		SSP1STAT = %00000000	' Sample at middle of data output time, Mode 1, 1: Transmit on idle to active clock transition.
+		SSP1CON1 = %00010000	' SPI master mode, clock = Fosc/64, Mode 1, 1: Clock idle high.
+		SSPEN = 1		' Enable hardware SPI port.
+	Endif
+	Return
+
+
+' Subroutine to release hardware SSP from SPI
+CloseSPIM:
+	If (SDC_UseHardSPI) Then
+		SSPEN = 0		' Disable hardware SPI port.
+	Endif
+	Return
+
+
+' SPI Read subroutine
+'  Returns Byte SDC_data_in
+ReadMedia:
+	If (SDC_UseHardSPI) Then
+		SDC_data_in = SSP1BUF	' Clear the buffer.
+		SSP1IF = 0		' Clear the interrupt flag.
+		SSP1BUF = $ff		' Shift out a dummy byte.
+		While !SSP1IF		' Wait for receive byte.
+		Wend
+		SDC_data_in = SSP1BUF	' Get the byte.
+	Else
+		SDO = 1			' Shift out high bits while shifing in data.
+		Shiftin SDI, SCL, 6, [SDC_data_in]	' MSb first, clock idle high.
+	Endif
+	Return			' Return Byte SDC_data_in.
+
+
+' Subroutine to write $ff twice to send two CRC bytes
+' The code assumes CRC values are ignored (the default in SPI mode)
+SendCRC:
+	' Fall through to ReadCRC.
+
+' Subroutine to write $ff twice to clock in two CRC bytes
+ReadCRC:
+	SDC_data_out = $ff
+	Gosub WriteSPIM		' Then fall through to Send8ClkCycles.
+
+' Subroutine to send 8 clock cycles
+Send8ClkCycles:
+	SDC_data_out = $ff		' Data pin must be high.
+'	Goto WriteSPIM		' Send the clocks. (Fall through)
+
+
+' SPI Write subroutine
+'  Writes Byte SDC_data_out
+WriteSPIM:
+	If (SDC_UseHardSPI) Then
+		SDC_data_in = SSP1BUF	' Clear the buffer.
+		SSP1IF = 0		' Clear the interrupt flag.
+		SSP1BUF = SDC_data_out	' Send the byte.
+		If (WCOL) Then Return	' Check for write collision.
+		While !SSP1IF		' Wait for send to complete.
+		Wend
+	Else
+		Shiftout SDO, SCL, 5, [SDC_data_out]	' MSb first, clock idle high.
+	Endif
+	Return
+
+
+' Subroutine to find command information
+'  Byte SDC_cmd is the command index
+'  Returns Bytes SDC_CmdCode, SDC_CRC, and SDC_moredataexpected
+sdmmc_cmdtable:
+	Lookup SDC_cmd, [$40, $41, $50, $51, $58, $7b], SDC_CmdCode
+	Lookup SDC_cmd, [$95, $f9, $ff, $ff, $ff, $25], SDC_CRC
+	Lookup SDC_cmd, [NODATA, NODATA, NODATA, MOREDATA, MOREDATA, NODATA], SDC_moredataexpected
+	Return			' Returns Bytes SDC_CmdCode, SDC_CRC and SDC_moredataexpected.
+
+
+' Subroutine to send a command to the SD card
+'  Byte SDC_cmd is the command index
+'  Long SDC_address is the address
+'  Returns Word SDC_response
+SendSDCCmd:
+	' Bring the card's chip select line low.
+	SD_CS = 0
+	' Send the command byte, SDC_address bytes, and SDC_CRC byte.
+	' The WriteSPIM subroutine writes a byte on the SPI bus.
+	Gosub sdmmc_cmdtable	' Use SDC_cmd to get command information.
+	SDC_data_out = SDC_CmdCode
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	SDC_data_out = SDC_address.Byte3
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	SDC_data_out = SDC_address.Byte2
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	SDC_data_out = SDC_address.Byte1
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	SDC_data_out = SDC_address.Byte0
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	SDC_data_out = SDC_CRC
+	Gosub WriteSPIM		' Write Byte SDC_data_out.
+	' Read a byte from the card until the byte doesn't equal $ff or a timeout occurs.
+	For SDC_timeout = 8 To 0 Step -1
+		Gosub ReadMedia	' Read Byte SDC_data_in from SPI bus.  Returns SDC_data_in.
+		SDC_response = SDC_data_in
+		If (SDC_response != SDC_FLOATING_BUS) Then SDC_timeout = 0	' Got a response, end the loop.
+	Next SDC_timeout
+	' Generate 8 clock cycles.
+	Gosub Send8ClkCycles
+	' If no more data is expected for this command, deselect the card.
+	If (!SDC_moredataexpected) Then
+		SD_CS = 1
+	Endif
+	Return			' Return Word SDC_response.
+
+
+' Subroutine to read a sector
+'  Long SDC_sector_addr is the sector address to read
+'  Returns Byte SDC_status and Byte array SDC_buffer
+SectorRead:
+	SDC_status = sdcValid	' Set default error code.
+	' Issue a READ_SINGLE_BLOCK command.
+	' Specify the address of the first byte to read in the media.
+	' To obtain the address of a sector's first byte,
+	' shift the sector address left 9 times to multiply by 512 (sector size).
+	SDC_cmd = READ_SINGLE_BLOCK
+	SDC_address = SDC_sector_addr << 9
+	Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address, Returns Word SDC_response.
+	' A response of 0 indicates success.
+	If (SDC_response != 0) Then
+		Gosub SendSDCCmd	' Try once more to send Byte SDC_cmd to Long SDC_address, Returns Word SDC_response.
+		If (SDC_response != 0) Then
+			SDC_status = sdcCardBadCmd
+			' Deselect the card.
+			SD_CS = 1
+			Return
+		Endif
+	Endif
+	' The command was accepted.
+	' Read from the card until receiving a response or a timeout.
+	Pauseus 40	' Timing delay- at least 8 clock cycles.
+	For SDC_timeout = $2ff To 0 Step -1			
+		Gosub ReadMedia	' Read Byte SDC_data_in from SPI bus.  Returns SDC_data_in.
+		Pauseus 40	' Timing delay- at least 8 clock cycles.
+		If (SDC_data_in != SDC_FLOATING_BUS) Then SDC_timeout = 0	' Got a response, end the loop.
+	Next SDC_timeout
+	If (SDC_data_in != DATA_START_TOKEN) Then
+		' The card didn't send a data start token.
+		SDC_status = sdcCardTimeout
+	Else
+		' The card sent a data start token.
+		' Read a sector's worth of data from the card.
+		For SDC_index = 0 To (MEDIA_SECTOR_SIZE - 1)
+			Gosub ReadMedia	' Read Byte SDC_data_in from SPI bus.  Returns SDC_data_in.
+			SDC_buffer[SDC_index] = SDC_data_in
+		Next SDC_index
+		' Read the CRC bytes.
+		Gosub ReadCRC	' Just sends 16 clocks.
+		' Generate 8 clock cycles to complete the command.
+		Gosub Send8ClkCycles
+	Endif
+	' Deselect the card.
+	SD_CS = 1
+	Return			' Return Byte SDC_status.
+
+
+' Subroutine to write a sector
+'  Long SDC_sector_addr is the sector address to write
+'  Byte array SDC_buffer is data to write
+'  Returns Byte SDC_status
+SectorWrite:
+	If (SDC_address = 0) Then
+		SDC_status = sdcCardBadCmd
+	Else
+		SDC_status = sdcValid	' Set default error code.
+		' Issue a WRITE_SINGLE_BLOCK command.
+		' Pass the address of the first byte to write in the media.
+		' To obtain the address of a sector's first byte,
+		' shift the sector address left 9 times to multiply by 512 (sector size).
+		SDC_cmd = WRITE_SINGLE_BLOCK
+		SDC_address = SDC_sector_addr << 9
+		Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address, Returns Word SDC_response.
+		' A response of 0 indicates success.
+		If (SDC_response != 0) Then
+			SDC_status = sdcCardBadCmd
+		Else
+			' The command was accepted.
+			' Send a data start token.
+			SDC_data_out = DATA_START_TOKEN
+			Gosub WriteSPIM	' Write Byte SDC_data_out.
+			' Write a sector's worth of data.
+			For SDC_index = 0 To (MEDIA_SECTOR_SIZE - 1)
+				SDC_data_out = SDC_buffer[SDC_index]
+				Gosub WriteSPIM	' Write Byte SDC_data_out.
+			Next SDC_index
+			' Send the CRC bytes.
+			Gosub SendCRC	' Just sends 16 1s.
+			' Read from the card's response.
+			Gosub ReadMedia	' Read Byte SDC_data_in from SPI bus.  Returns SDC_data_in.
+			If ((SDC_data_in & $0f) != DATA_ACCEPTED) Then
+				SDC_status = sdcCardDataRejected
+			Else
+				' The card is writing data into the storage media.
+				' Wait for the card to return non-zero (not busy) or a timeout.
+				For SDC_timeout = $ffff To 0 Step -1			
+					Gosub ReadMedia	' Read Byte SDC_data_in from SPI bus.  Returns SDC_data_in.
+					If (SDC_data_in != 0) Then SDC_timeout = 0	' Got a response, end the loop.
+				Next SDC_timeout
+				If (SDC_data_in = 0) Then
+					SDC_status = sdcCardTimeout
+				Endif
+			Endif
+			' The write was successful.
+			' Generate 8 clock cycles to complete the command.
+			Gosub Send8ClkCycles
+		Endif
+	Endif
+	' Deselect the card.
+	SD_CS = 1
+	Return			' Return Byte SDC_status.
+
+
+' Subroutine to initialize the card
+'  Returns Byte SDC_status
+MediaInitialize:
+	SDC_status = sdcValid	' Set default error code.
+	' Set up the pins.
+	Gosub InitIO
+	' Allow the card time to initialize.
+	Pause 1
+	' Open the SPI port.
+	' Clock speed must be <= 400kHz until the card is initialized
+	' and the CSD register has been read.
+	' Multimedia cards require CKE = 0, CKP = 1
+	' and sampling DataOut in the middle of a clock cycle.
+	Gosub OpenSPIM
+	' Allow the card time to initialize some more.
+	Pause 1
+	' Generate clock cycles for 1 millisecond as required by the MultiMediaCard spec.
+	For SDC_timeout1 = 1 To 10
+		Gosub Send8ClkCycles
+	Next SDC_timeout1
+	' Select the card.
+	SD_CS = 0
+	Pause 1
+	' Issue the GO_IDLE_STATE command to select SPI mode.
+	SDC_cmd = GO_IDLE_STATE
+	SDC_address = 0
+	Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address.  Returns Word SDC_response.
+	If (SDC_response = SDC_BAD_RESPONSE) Then
+		SDC_status = sdcCardInitCommFailure
+		Goto InitError
+	Endif
+	' A response of $01 means the card is in the idle state and is initializing.
+	If ((SDC_response & $F7) != $01) Then
+		SDC_status = sdcCardNotInitFailure
+		Goto InitError
+	Endif
+	' Issue the SEND_OP_COND command until the card responds or a timeout.
+	For SDC_timeout1 = $fff To 0 Step -1
+ 		SDC_cmd = SEND_OP_COND
+		SDC_address = 0
+		Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address.  Returns Word SDC_response.
+		If (SDC_response = $00) Then SDC_timeout1 = 0	' Got a response, end the loop.
+	Next SDC_timeout1
+	If (SDC_response != $00) Then
+		SDC_status = sdcCardInitTimeout
+		Goto InitError
+	Endif
+	' The command succeeded.
+	Pause 2
+	' Increase the clock speed.
+	Gosub OpenSPIMFast
+        ' Turn off CRC7 if we can - might be an invalid cmd on some cards (CMD59).
+	SDC_cmd = CRC_ON_OFF
+	SDC_address = 0
+	Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address.  Returns Word SDC_response.
+	' Issue the SET_BLOCKLEN command to set the block length to 512.
+	' (optional, since this is the default.)
+	SDC_cmd = SET_BLOCKLEN
+	SDC_address = MEDIA_SECTOR_SIZE
+	Gosub SendSDCCmd	' Send Byte SDC_cmd to Long SDC_address.  Returns Word SDC_response.
+	' Read sector zero from the card into msd_buffer until success or a timeout.
+	' Some cards require multiple attempts.
+	For SDC_timeout1 = $ff To 0 Step -1
+		SDC_sector_addr = 0
+		Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+		If (SDC_status = sdcValid) Then SDC_timeout1 = 0	' Got a valid response, end the loop.
+	Next SDC_timeout1
+	If (SDC_status != sdcValid) Then
+		SDC_status = sdcCardNotInitFailure
+		Goto InitError
+	Endif
+	Return			' Return Byte SDC_status.
+InitError:
+	' Make sure device is deselected.
+	SD_CS = 1
+	Return			' Return Byte SDC_status.
+
+
+' Subroutine to deselect the card and release the hardware SPI port
+ShutdownMedia:
+	' Deselect the device.
+	SD_CS = 1
+	' Release hardware SSP port, if used.
+	Goto CloseSPIM
+
+
+' Subroutines for FAT16
+' Subroutine to load the master boot record
+'  Returns Byte FAT_error
+LoadMBR:
+	FAT_error = CE_GOOD
+	' Get the partition table from the MBR.
+	SDC_sector_addr = 0
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_BAD_SECTOR_READ
+		Return		' Return Byte FAT_error.
+	Endif
+	' Ensure it is good.
+	If ((DISK_buffer[510] != $55) || (DISK_buffer[511] != $aa)) Then
+		FAT_error = CE_BAD_PARTITION
+		Return		' Return Byte FAT_error.
+	Endif
+	' Valid Master Boot Record loaded.
+	' Get the 32-bit offset to the first partition.
+	DISK_firsts.Byte0 = DISK_buffer[454]
+	DISK_firsts.Byte1 = DISK_buffer[455]
+	DISK_firsts.Byte2 = DISK_buffer[456]
+	DISK_firsts.Byte3 = DISK_buffer[457]
+	' Check if partition type is acceptable.
+	Select Case (DISK_buffer[450])
+		Case $01
+			DISK_type = FAT12
+			FAT_error = CE_CARDFAT12
+		Case $04, $06, $0e
+			DISK_type = FAT16
+		Case $0b, $0c
+			DISK_type = FAT32
+			FAT_error = CE_CARDFAT32
+		Case Else
+			FAT_error = CE_BAD_PARTITION
+	End Select
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to load the boot sector
+'  Returns Byte FAT_error
+LoadBootSector:
+	FAT_error = CE_GOOD
+	' Get the Boot Sector.
+	SDC_sector_addr = DISK_firsts
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_BAD_SECTOR_READ
+		Return		' Return Byte FAT_error.
+	Endif
+	' Verify the Boot Sector is valid.
+	If ((DISK_buffer[510] != $55) || (DISK_buffer[511] != $aa)) Then
+		FAT_error = CE_NOT_FORMATTED
+		Return		' Return Byte FAT_error.
+	Endif
+	' Get the full partition/drive layout.
+	' Get the size of a sector.
+	DISK_BytesPerSec.Byte0 = DISK_buffer[11]
+	DISK_BytesPerSec.Byte1 = DISK_buffer[12]
+	If ((DISK_BytesPerSec = 0) || ((DISK_BytesPerSec & 1) = 1)) Then
+		FAT_error = CE_NOT_FORMATTED
+		Return		' Return Byte FAT_error.
+	Endif
+	' Get the size of a cluster.
+	DISK_SecPerClus = DISK_buffer[13]
+	' Determine FAT, root and data LBAs.
+	' FAT = first sector in partition (Boot Sector) + number of reserved sectors.
+	DISK_fat = DISK_firsts + (DISK_buffer[14] + (DISK_buffer[15] << 8))
+	' Get the number of FATs.
+	DISK_fatcopy = DISK_buffer[16]
+	' Get the maximum number of entries in the root directory.
+	DISK_maxroot.Byte0 = DISK_buffer[17]
+	DISK_maxroot.Byte1 = DISK_buffer[18]
+	' Determine the number of sectors in one FAT.
+	DISK_fatsize.Byte0 = DISK_buffer[22]
+	DISK_fatsize.Byte1 = DISK_buffer[23]
+	' root is the sector location of the root directory.
+	DISK_root = DISK_fat + (DISK_fatcopy * DISK_fatsize)
+	FAT_RootDirSectors = ((DISK_maxroot * NUMBER_OF_BYTES_IN_DIR_ENTRY) + (DISK_BytesPerSec - 1)) / DISK_BytesPerSec
+	' Get the total number of sectors.
+	FAT_TotSec.Byte0 = DISK_buffer[32]
+	FAT_TotSec.Byte1 = DISK_buffer[33]
+	FAT_TotSec.Byte2 = DISK_buffer[34]
+	FAT_TotSec.Byte3 = DISK_buffer[35]
+	' Figure out how many data sectors there are.
+	DISK_maxcls = (FAT_TotSec - ((DISK_root + FAT_RootDirSectors) + DISK_firsts + 2)) / DISK_SecPerClus
+	' Straight out of MS FAT Hardware White Paper.
+	If (DISK_maxcls < 4085) Then
+		' Volume is FAT12.
+		DISK_type = FAT12
+		FAT_error = CE_CARDFAT12
+	Else
+		If (DISK_maxcls < 65525) Then
+			' Volume is FAT16.
+			DISK_type = FAT16
+		Else
+			'Volume is FAT32.
+			DISK_type = FAT32
+			FAT_error = CE_CARDFAT32
+		Endif
+	Endif
+ 	' data = root + (maxroot * 32 / 512).
+	DISK_data = DISK_root + (DISK_maxroot >> 4)
+	' Make sure that we can read in a complete sector.
+	If (DISK_BytesPerSec != MEDIA_SECTOR_SIZE) Then
+		FAT_error = CE_NOT_FORMATTED
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to mount the disk/card
+'  Returns Byte FAT_error
+DISKmount:
+	DISK_mount = FALSE	' Default invalid.
+	Gosub MediaInitialize	' Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_INIT_ERROR
+	Else
+		' Load the Master Boot Record.
+		Gosub LoadMBR	' Returns Byte FAT_error.
+		If (FAT_error = CE_GOOD) Then
+			' Now load the boot sector.
+			Gosub LoadBootSector	' Returns Byte FAT_error.
+			If (FAT_error = CE_GOOD) Then
+				DISK_mount = TRUE	' Mark that the DISK mounted successfully.
+			Endif
+		Endif
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to read the next sector from the FAT
+' Only reads new sector if the entry to read is the first one in the sector
+'  Reads FAT entry for cluster number Word FAT_ccls
+'  Returns Word FAT_c which is the number of the next cluster in file or directory or EOC marker
+FATreadQueued:
+	' Each sector holds 256 two-byte entries.
+	' If the LSB of the cluster number = 0, the FAT entry is a new sector.
+	If (FAT_ccls.Byte0 != 0) Then FATreadQ	' Not new so skip the read.
+	' Fall through to FATread
+
+' Subroutine to read from the FAT
+'  Reads FAT entry for cluster number Word FAT_ccls
+'  Returns Word FAT_c which is the number of the next cluster in file or directory or EOC marker
+FATread:
+	' The address (FAT_ccls) is two bytes, LSB first.
+	' The LBA of the FAT sector containing the cluster's data is the FAT's starting address
+	' plus the high byte of the current cluster.
+	' (Each sector contains 256 two-byte entries.)
+	SDC_sector_addr = DISK_fat + FAT_ccls.Byte1
+	' Read the sector.
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_c = CLUSTER_FAIL
+		Return		' Return Word FAT_c = CLUSTER_FAIL
+	Endif
+FATreadQ:
+	' To get the value stored in the cluster's entry,
+	' read 2 bytes in the buffer of retrieved data
+	' beginning at offset = low byte of current cluster's address << 1.
+	' Shift left 1 (multiply by 2) because each entry is 2 bytes.
+	FAT_c.Byte0 = DISK_buffer[FAT_ccls.Byte0 << 1]
+	FAT_c.Byte1 = DISK_buffer[(FAT_ccls.Byte0 << 1) + 1]
+	If (FAT_c >= LAST_CLUSTER) Then
+		' The entry is an EOC marker.
+		FAT_c = LAST_CLUSTER
+	Endif
+	Return			' Return Word FAT_c
+
+
+' Subroutine to write to the FAT
+'  Writes FAT entry for cluster number Word FAT_ccls with value Word FAT_v
+'  Returns Word FAT_c
+FATwrite:
+	FAT_c = 0		' We need to start FAT_c as something other than CLUSTER_FAIL and this looks like the best bet.
+	' Each entry is 2 bytes.
+	' To get the offset of the entry in the FAT, multiply the cluster number by 2.
+	FAT_p = FAT_ccls * 2
+	' To get the sector containing the entry, divide the entry's offset by 512.
+	SDC_sector_addr = DISK_fat + (FAT_ccls.Byte1)
+	' Read the sector into the buffer.
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_c = CLUSTER_FAIL
+		Return		' Return Word FAT_c = CLUSTER_FAIL
+	Endif
+	' To get the offset within the sector, set bits 9-15 of the entry's offset to zero.
+	FAT_p = FAT_p & $1ff
+	' Copy the passed value (FAT_v) into the FAT entry for the passed cluster number (FAT_ccls)
+	' in the buffer.  The LSB is at the lower offset.
+	DISK_buffer[FAT_p] = FAT_v.Byte0
+	DISK_buffer[FAT_p + 1] = FAT_v.Byte1
+	' Write the edited buffer to both FAT copies
+	Gosub SectorWrite	' Previous Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_c = CLUSTER_FAIL
+		Return		' Return Word FAT_c = CLUSTER_FAIL
+	Endif
+	SDC_sector_addr = SDC_sector_addr + DISK_fatsize
+	Gosub SectorWrite	' Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_c = CLUSTER_FAIL
+		Return		' Return Word FAT_c = CLUSTER_FAIL
+	Endif
+	Return			' Return Word FAT_c
+
+
+' Subroutine to return the LBA of the cluster's first sector
+'  Word FAT_cluster is the cluster number
+'  Returns Long FAT_sector as the sector number
+Cluster2Sector:
+	' Data clusters 0 and 1 don't exist.
+	' If cluster = 0 or 1, assume it's the root directory.
+	If (FAT_cluster = 0) || (FAT_cluster = 1) Then
+		FAT_sector = DISK_root + FAT_cluster
+	Else
+		' The data area begins with cluster 2.
+		' Subtract 2 from the cluster number to get the cluster number within the data area.
+		' Multiply the result by the number of sectors per cluster to get the sector number
+		' within the data area.
+		' Add the number of the first sector in the data area to get the absolute sector
+		' number for the cluster.
+		FAT_sector = ((FAT_cluster - 2) * DISK_SecPerClus) + DISK_data
+	Endif
+	Return			' Return Long FAT_sector
+
+
+' Subroutine to find an empty cluster in the FAT
+'  Returns Word FAT_c which is the number of the next empty cluster or 0 if there are none left
+FATfindEmptyCluster:
+	' Save the current cluster number.
+	FAT_ccls = FILE_ccls
+	' Cluster 2 is the first cluster.
+	If (FAT_ccls < 2) Then
+		FAT_ccls = 2
+	Endif
+	FAT_cls = FAT_ccls	' Save current cluster for compare in loop.
+	' Read the FAT entry for the current cluster.
+	Gosub FATread	' Reads cluster Word FAT_ccls.  Returns Word FAT_c.
+	' Starting at the cluster immediately following the current cluster number,
+	' scan through the FAT looking for an empty cluster.
+	While (FAT_ccls)	' While cluster not empty
+		' Read an entry.
+		Gosub FATReadQueued	' Reads cluster Word FAT_ccls.  Returns Word FAT_c.
+		If (FAT_c = CLUSTER_FAIL) Then
+			FAT_c = 0	' No go.
+			Return	' Return Word FAT_c.
+		Endif
+		' Quit the loop on finding an empty cluster.
+		If (FAT_c = CLUSTER_EMPTY) Then
+			FAT_c = FAT_ccls	' Save cluster found.
+			Return	' Return Word FAT_c.
+		Endif
+		FAT_ccls = FAT_ccls + 1	' Move to next cluster
+		' If we get to the end of the FAT, start from the beginning.
+		If ((FAT_c = END_CLUSTER) || (FAT_ccls >= DISK_maxcls)) Then
+			FAT_ccls = 2
+		Endif
+		' If we get to the current cluster, there are no empty entries.
+		If (FAT_ccls = FAT_cls) Then
+			FAT_c = 0
+			Return	' Return Word FAT_c.
+		Endif
+	Wend
+	FAT_c = FAT_ccls
+	Return			' Return Word FAT_c.
+
+
+' Subroutine to allocate an additional cluster for a file
+'  Returns Byte FAT_error
+FILEallocate_new_cluster:
+	' Find an empty cluster
+	Gosub FATfindEmptyCluster	' Returns Word FAT_c with first empty cluster.
+	If (FAT_c = 0) Then
+		FAT_error = CE_DISK_FULL
+		Return		' Return Byte FAT_error.
+	Endif
+	' Mark the cluster as used and as the last one in the chain.
+	FAT_v = LAST_CLUSTER_FAT16
+	FAT_ccls = FAT_c
+	Gosub FATwrite		' Write Word FAT_v to cluster Word FAT_ccls.  Returns Word FAT_c.
+	If (FAT_c = CLUSTER_FAIL) Then
+		FAT_error = CE_WRITE_ERROR
+		Return		' Return Byte FAT_error.
+	Endif
+	' Write the cluster's number in the FAT entry for the FILE structure's ccls member.
+	FAT_v = FAT_ccls
+	FAT_ccls = FILE_ccls
+	Gosub FATwrite		' Write Word FAT_v to cluster Word FAT_ccls.  Returns Word FAT_c.
+	If (FAT_c = CLUSTER_FAIL) Then
+		FAT_error = CE_WRITE_ERROR
+		Return		' Return Byte FAT_error.
+	Endif
+	' Set the FILE structure's ccls member to the new, empty cluster's number.
+	FILE_ccls = FAT_v
+	FAT_error = CE_GOOD
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to erase a cluster
+'  Erases Word FAT_cluster
+'  Returns Byte FAT_error
+EraseCluster:
+	FAT_error = CE_GOOD
+	' Get the LBA of the passed cluster number.
+	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+	' Set the buffer's data to zeroes.
+	For FAT_n = 0 To (MEDIA_SECTOR_SIZE - 1)
+		DISK_buffer[FAT_n] = 0
+	Next FAT_n
+	' Write the buffer's contents to the sector in the storage media.
+	SDC_sector_addr = FAT_sector
+	For FAT_i = 1 To DISK_SecPerClus
+		Gosub SectorWrite	' Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+		If (SDC_status != sdcValid) Then
+			FAT_error = CE_WRITE_ERROR
+			Return	' Return Byte FAT_error.
+		Endif
+		SDC_sector_addr = SDC_sector_addr + 1
+	Next FAT_i
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to reserve an available cluster
+'  Returns Word FAT_cluster and Byte FAT_error
+FILECreateHeadCluster:
+	' Use the FAT to find an available cluster.
+	Gosub FATfindEmptyCluster	' Returns Word FAT_c with first empty cluster.
+	If (FAT_c = 0) Then
+		FAT_error = CE_DISK_FULL
+	Else
+		' Mark the cluster as in use and the last one in the chain.
+		FAT_v = LAST_CLUSTER_FAT16
+		FAT_ccls = FAT_c
+		Gosub FATwrite	' Write Word FAT_v to cluster Word FAT_ccls.  Returns Word FAT_c.
+		If (FAT_c = CLUSTER_FAIL) Then
+			FAT_error = CE_WRITE_ERROR
+			Return	' Return Byte FAT_error.
+		Endif
+		FAT_cluster = FAT_ccls
+		Gosub EraseCluster	' Erase Word FAT_cluster.  Returns Byte FAT_error.
+	Endif
+	Return			' Returns Word FAT_cluster and Byte FAT_error.
+
+
+' Subroutine to write a directory entry
+'  Directory entry is Word FAT_fHandle
+'  Returns Byte FAT_status with true/false status
+Write_File_Entry:
+	' buffer[FAT_fHandle % DIRENTRIES_PER_SECTOR] = dir
+	For FAT_i = 0 To 31		' Copy 32 bytes
+		 DISK_buffer[FAT_i + ((FAT_fHandle // DIRENTRIES_PER_SECTOR) << 5)] = DIRB[FAT_i]	' << 5 is the same as * 32
+	Next FAT_i
+	' Save the directory cluster.
+	FAT_cluster = FILE_dirccls
+	' A sector can hold 16 directory entries.
+	' Shift right 4 times to get the sector within the directory.
+	' If FAT_fHandle < 10h, it's the directory's first sector and FAT_offset2 = 0.
+	' If FAT_fHandle >= 10h and < 20h, it's the directory's second sector and FAT_offset2 = 1.
+	FAT_offset2 = FAT_fHandle >> 4
+	' If it's not the root directory,
+	' Divide the sector number obtained above by the number of sectors per cluster.
+	' The remainder (FAT_offset2) is the sector number within the cluster.
+	If (FAT_cluster != 0) Then
+		FAT_offset2 = FAT_offset2 // DISK_SecPerClus
+	Endif
+	' Get the sector number of the passed directory cluster.
+	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+	' Write the data in DISK_buffer to the entry's sector in the media.
+	SDC_sector_addr = FAT_sector + FAT_offset2
+	Gosub SectorWrite	' Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_status = FALSE
+	Else
+		FAT_status = TRUE
+	Endif
+	Return			' Return Byte FAT_status.
+
+
+' Subroutine to copy 32 bytes of a directory entry from the buffer to the DIR structure
+'  Starts at offset Word FAT_curEntry
+CopyDirEntry:
+	For FAT_i = 0 To 31		' Copy 32 bytes.
+		DIRB[FAT_i] = DISK_buffer[FAT_i + ((FAT_curEntry // DIRENTRIES_PER_SECTOR) << 5)]	' << 5 is the same as * 32
+	Next FAT_i
+	Return
+
+
+' Subroutine to return 32 bytes of a directory entry
+'  Word FAT_fHandle is the number of the entry within the directory
+'  Byte FAT_ForceRead helps the code decide whether to read a sector from the media or
+'  use the data already in DISK_buffer
+'  Returns Byte FAT_status
+Cache_File_Entry:
+	FAT_status = TRUE
+	' Save FAT_fHandle to FAT_curEntry.
+	FAT_curEntry = FAT_fHandle
+	' Save the number of the first cluster of the file's directory.
+	FAT_cluster = FILE_dirclus
+	' Save the number of the directory cluster to begin looking for the file in.
+	FAT_ccls = FILE_dirccls
+	' Get the number of the entry's sector within the directory.
+	' A sector can hold 16 directory entries.  Shift right 4 times to get the entry number.
+	' For example, if FAT_curEntry < 10h, it's the directory's first sector and FAT_offset2 = 0.
+	' If FAT_curEntry >> 10h and < 20h, it's the directory's second sector and FAT_offset2 = 1.
+	FAT_offset2 = FAT_curEntry >> 4
+	If (FAT_cluster != 0) Then
+		' It's not the root directory.
+		' To get the number of the entry's sector within its cluster,
+		' divide the sector number obtained above by the number of sectors per cluster.
+		' The remainder (FAT_offset2) is the sector's number within its cluster.
+		' (The first sector is sector 0.)
+		FAT_offset2 = FAT_offset2 // DISK_SecPerClus
+	Endif
+	If (FAT_ForceRead || ((FAT_curEntry & $0f) = 0)) Then
+		' FAT_ForceRead is true OR the entry is the first one in a sector.
+		' If either Condition 1 or Condition 2 below is true,
+		' don't assume that FAT_ccls is the cluster to begin looking in for the entry to read.
+		' Instead, read the entry's cluster number from the FAT:
+		' Condition 1: FAT_ForceRead is true.
+		' Condition 2: the entry IS in a cluster's first sector (FAT_offset2 = 0)
+		' AND the entry ISN'T in the directory's first cluster (FAT_curEntry > 16).
+		If ((FAT_offset2 = 0) && (FAT_curEntry >= DIRENTRIES_PER_SECTOR) || FAT_ForceRead) Then
+			If (FAT_cluster = 0) Then
+				' It's the root directory. The current cluster = 0.
+				FAT_ccls = 0
+			Else
+				' It's not the root directory.
+				If (FAT_ForceRead) Then
+					' Get the number of FAT_curEntry's cluster within its directory:
+					'  (FAT_curEntry / directory entries per cluster).
+					' directory entries per cluster =
+					' ((directory entries / sector) * (sectors / cluster)).
+					FAT_numofclus = FAT_curEntry / (DIRENTRIES_PER_SECTOR * DISK_SecPerClus)
+				Else
+					' The entry is in a cluster's first sector
+					' AND the entry's first cluster isn't the first one in the directory
+					' AND it's not the root directory.
+					' Get the next cluster number.
+					FAT_numofclus = 1
+				Endif
+				' To find the cluster containing FAT_curEntry,
+				' get the directory's cluster number from the FAT until reaching the
+				' cluster specified by FAT_numofclus or the directory's last cluster.
+				' On entering the loop, FAT_ccls = the passed dsk->dircclus member.
+				While (FAT_numofclus)
+					' Read the next cluster number from the current cluster's FAT entry.
+					Gosub FATread	' Reads cluster Word FAT_ccls, returns Word FAT_c.
+					FAT_ccls = FAT_c
+					If (FAT_ccls >= LAST_CLUSTER) Then CFEexitwhile
+					FAT_numofclus = FAT_numofclus - 1
+				Wend
+CFEexitwhile:
+			Endif
+		Endif
+		' We have a cluster number for the entry, either retrieved from the FAT
+		' or obtained from the passed FILE structure.
+		' If FAT_ccls is an EOC marker (LAST_CLUSTER code),
+		' the directory doesn't have as many clusters as we thought.  We can't get the entry.
+		If (FAT_ccls < LAST_CLUSTER) Then
+			' The current cluster isn't the last one in the file.
+			' We need to read a sector from the media.
+			' Store the cluster number in the FILE structure.
+			FILE_dirccls = FAT_ccls
+			' Get the LBA of the cluster's first sector.
+			FAT_cluster = FAT_ccls
+			Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector
+			' If it's the root directory (cluster 0), be sure that the FAT_curEntry's sector isn't
+			' at or beyond the start of the volume's data area.
+			' (FAT_curEntry's sector = the cluster's initial sector (FAT_sector) +
+			' the number of the sector in the cluster containing FAT_curEntry (FAT_offset2))
+			If ((FAT_ccls = 0) && ((FAT_sector + FAT_offset2) >= DISK_data)) Then
+				FAT_status = FALSE
+			Else
+				' The sector is in a valid location
+				' (either the root-directory area or the volume's data area).
+				' Read the data in the sector containing FAT_curEntry.
+				' sector = the cluster's first sector.
+				' FAT_offset2 = the number of the sector within the cluster.
+				SDC_sector_addr = FAT_sector + FAT_offset2
+				Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+				If (SDC_status != sdcValid) Then
+					FAT_status = FALSE
+				Else
+					' The sector read was successful.
+					' Get the requested entry.
+					If (FAT_ForceRead) Then
+						' The directory entry is in the DSK sturcture's buffer member.
+						' ((*FAT_curEntry) % DIRENTRIES_PER_SECTOR) =
+						' then number of entries within the sector.
+						Gosub CopyDirEntry	' dir = buffer[FAT_curEntry %DIRENTRIES_PER_SECTOR]
+					Else
+						' FAT_ForceRead is false, so the entry is the first one in the DISK
+						' structure's buffer member.
+						FAT_curEntry = 0	' Point to first entry in sector.
+						Gosub CopyDirEntry	' dir = buffer[0]
+					Endif
+				Endif
+			Endif
+		Else
+			' The cluster number wasn't valid.
+			FAT_status = FALSE
+		Endif
+	Else
+		' FAT_ForceRead is false AND FAT_curEntry isn't the first entry in the sector.
+		' OK to read the directory entry directly from the passed DISK structure's buffer.
+		' (No need to read a sector from the storage media).
+		' ((*FAT_curEntry) % DIRENTRIES_PER_SECTOR) = 
+		' the number of entries within the sector.
+		Gosub CopyDirEntry	' dir = buffer[FAT_curEntry % DIRENTRIES_PER_SECTOR]
+	Endif
+	Return			' Return Byte FAT_status.
+
+
+' Subroutine to skip past long filenames to find a file's 8.3 entry
+'  File is pointed to in directory by Word FAT_fHandle
+LoadDirAttrib:
+	FILE_dirccls = FILE_dirclus
+	' Get the directory entry and store the sector with the entry
+	' in the FILE structure's dsk_buffer member.
+	FAT_ForceRead = TRUE
+	Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+	If (FAT_status = FALSE) Then
+		Return
+	Endif
+	' Read the first character of the filename.
+	FAT_a = DIR_Name[0]
+	If ((FAT_a = DIR_EMPTY) || (FAT_a = DIR_DEL)) Then
+		FAT_status = FALSE
+		Return
+	Else
+		' The entry exists. Get the directory's attributes.
+		FAT_a = DIR_Attr
+		' Get the first entry that isn't a long-file-name entry.
+		While (FAT_a = ATTR_LONG_NAME)
+			FAT_fHandle = FAT_fHandle + 1
+			' Retrieve a directory entry and get the attributes.
+			' The FAT_ForceRead parameter is false
+			' to prevent unnecessary sector reads.
+			FAT_ForceRead = FALSE
+			Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+			If (FAT_status = FALSE) Then
+				Return
+			Endif
+			FAT_a = DIR_Attr
+		Wend
+	Endif
+	Return
+
+
+' Subroutine to store an available cluster number in a file's directory entry
+'  Returns Byte FAT_error
+CreateFirstCluster:
+	' Save the number of the file's entry in the directory.
+	FAT_fHandle = FILE_entry
+	' Allocate a cluster for the file.
+	Gosub FILECreateHeadCluster	' Returns Word FAT_cluster and Byte FAT_error.
+	FAT_cls = FAT_cluster		' Save somewhere that won't get clobbered.
+	If (FAT_error = CE_GOOD) Then
+		' Get the file's directory entry.
+		Gosub LoadDirAttrib	' Word FAT_fHandle is directory entry.
+		' Store the file's cluster number is the directory entry.
+		DIR_FstClusLO = FAT_cls
+		DIR_FstClusHi = 0
+		' Write the entry to the directory.
+		Gosub Write_File_Entry	' Write directory entry Word FAT_fHandle.  Returns Byte FAT_status.
+		If (FAT_status != TRUE) Then
+			FAT_error = CE_WRITE_ERROR
+		Endif
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to find the next cluster in a file
+'  Returns Byte FAT_error
+FILEget_next_cluster:
+	' Save the file's current cluster number.
+	FAT_ccls = FILE_ccls
+	' Read the next cluster number from the FAT entry for the current cluster.
+	Gosub FATread	' Reads cluster Word FAT_ccls.  Returns Word FAT_c.
+	FAT_error = CE_GOOD	' Start off OK
+	If (FAT_c = CLUSTER_FAIL) Then
+		FAT_error = CE_BAD_SECTOR_READ
+	Else
+		If (FAT_c >= DISK_maxcls) Then
+			' The cluster number is greater than the volume's last cluster number.
+			FAT_error = CE_INVALID_CLUSTER
+		Endif
+		If (FAT_c >= LAST_CLUSTER) Then
+			' The entry is an EOC marker, so the current cluster is the file's last one.
+			FAT_error = CE_FAT_EOF
+			Return
+		Endif
+		' The cluster number is valid. Store the new current cluster number.
+	Endif
+	FILE_ccls = FAT_c
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to read information from a file's directory entry
+'  File is pointed to in directory by Word FAT_fHandle
+'  Returns Byte FAT_status with FOUND, NOT_FOUND or NO_MORE
+Fill_File_Object:
+	If (((FAT_fHandle & $0f) = 0) && (FAT_fHandle != 0)) Then
+		FILE_dirccls = FILE_dirclus
+		FAT_ForceRead = TRUE
+	Else
+		FAT_ForceRead = FALSE
+	Endif
+	Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte s.
+	' Read the first character of the name from the entry.
+	FAT_a = DIR_Name[0]
+	If ((FAT_status = FALSE) || (FAT_a = DIR_EMPTY)) Then
+		FAT_status = NO_MORE	' The entry doesn't exist or is empty.
+		Return
+	Endif
+	If (FAT_a = DIR_DEL) Then
+		FAT_status = NOT_FOUND	' The entry is deleted.
+		Return
+	Endif
+	FAT_status = FOUND
+	' An entry exists. Store the entry's name in the file structure's name member.
+	' DIR_Extension immediately follows DIR_Name in memory
+	For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+		FILE_name[FAT_i] = DIR_Name[FAT_i]
+	Next FAT_i
+	' Store the passed entry number.
+	FILE_entry = FAT_fHandle
+	' Store the entry's file size.
+	FILE_size = DIR_FileSize
+	' Store the entry's initial cluster number.
+	' DIR_FstClusHI	always 0 for FAT16
+	FILE_cluster = DIR_FstClusLO
+	' Store the entry's attributes
+	FILE_attributes = DIR_Attr
+	' Store the entry's date and time.
+	FILE_time = DIR_WrtTime
+	FILE_date = DIR_WrtDate
+	Return			' Return Byte FAT_status.
+
+
+' Subroutine to find a file in the directory
+'  Byte array FAT_FileName is name to match
+'  Returns Byte FAT_error
+FILEfind:
+	FAT_fHandle = FILE_entry
+	FAT_error = CE_FILE_NOT_FOUND
+	' Set the destination FILE structure's current cluster to the directory's cluster.
+	FILE_dirccls = FILE_dirclus
+	' Read a directory entry.
+	If ((FAT_fHandle = 0) || ((FAT_fHandle & $0f) != 0)) Then
+		FAT_ForceRead = TRUE
+		Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_BADCACHEREAD
+			Return	' Return Byte FAT_error.
+		Endif
+	Endif
+	' Read entries until finding the file or the end of the directory.
+	While (1)
+		If (FAT_error != CE_GOOD) Then
+			' Store information about the file.
+			Gosub Fill_File_object	' Get file information for Word FAT_fHandle.  Returns Byte FAT_status.
+			If (FAT_status = NO_MORE) Then
+				' The entry doesn't exist or is empty.
+				Goto Ffexitwhile
+			Endif
+		Else
+			' We should be good to go
+			Goto Ffexitwhile
+		Endif
+		If (FAT_status = FOUND) Then
+			' An entry was found.  Read the attributes.
+			FAT_a = FILE_attributes & ATTR_MASK
+			' If the entry is for a volume ID or hidden file, skip it.
+			If ((FAT_a != ATTR_VOLUME) && ((FAT_a & ATTR_HIDDEN) != ATTR_HIDDEN)) Then
+				FAT_error = CE_GOOD
+				' Look for name match.
+				For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+					' Get a character from the found file's name.
+					FAT_character = FILE_name[FAT_i]
+					' Convert character to lower case.
+					If ((FAT_character >= "A") && (FAT_character <= "Z")) Then FAT_character = FAT_character + $20
+					' Get the corresponding character from the file name we're searching for.
+					FAT_test = FAT_FileName[FAT_i]
+					' Convert character to lower case.
+					If ((FAT_test >= "A") && (FAT_test <= "Z")) Then FAT_test = FAT_test + $20
+					If (FAT_character != FAT_test) Then
+						' Quit the loop if a character does not match.
+						FAT_error = CE_FILE_NOT_FOUND
+						Goto Ffexitfor
+					Endif
+				Next FAT_i
+Ffexitfor:
+			Endif
+		Endif
+		' Increment the number of the entry in the directory.
+		FAT_fHandle = FAT_fHandle + 1
+	Wend
+Ffexitwhile:
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to find an available directory entry
+'  Starting entry is pointed to in directory by Word FAT_fHandle
+'  Returns Word FAT_fHandle and Byte FAT_status
+FindEmptyEntries:
+	FILE_dirccls = FILE_dirclus
+	' Call Cache_File_entry with FAT_ForceRead parameter = TRUE the first time
+	' to read the directory's sector from the media into DISK_buffer.
+	' FAT_fHandle contains the number of the entry to read in the directory.
+	FAT_ForceRead = TRUE
+	While (1)
+		' Get an entry.
+		Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+		' Set the FAT_ForceRead parameter FALSE so the function reads from the media
+		' only when necessary (when starting a new sector).
+		FAT_ForceRead = FALSE	' Every time but first time is FALSE.
+		If (FAT_status = FALSE) Then
+			Return	' Byte FAT_status = FALSE.
+		Endif
+		' Read the first character of the file name.
+		FAT_a = DIR_Name[0]
+		' Look for a deleted or empty entry.
+		If ((FAT_a = DIR_DEL) || (FAT_a = DIR_EMPTY)) Then
+			Return	' Byte FAT_status = TRUE.
+		Endif
+		' Increment the entry number.
+		FAT_fHandle = FAT_fHandle + 1
+	Wend
+'	Return			' Can't get here.
+
+
+' Subroutine to fill in information for a file and directory
+'  Directory entry is Word FAT_fHandle
+'  Returns Byte FAT_error
+PopulateEntries:
+	FAT_error = CE_GOOD
+	FILE_dirccls = FILE_dirclus
+	' Get the file's directory entry.
+	' The FILE structure's dirclus member is the first cluster
+	' of the directory containing the entry to read.
+	FAT_ForceRead = TRUE
+	Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte s.
+	If (FAT_status = FALSE) Then
+		FAT_error = CE_BADCACHEREAD
+		Return		' Return FALSE Byte FAT_status.
+	Endif
+	' Copy information into the entry.
+	For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+		DIR_Name[FAT_i] = FAT_FileName[FAT_i]
+	Next FAT_i
+	DIR_Attr = ATTR_ARCHIVE
+	DIR_NTRes = $00
+	DIR_FstClusHI = $0000	' High word of this entry's first cluster number.
+	DIR_FstClusLO = $0000	' Low word of this entry's first cluster number.
+	DIR_FileSize = 0	' File size.
+	' A system with a real-time clock would retrieve these values from the clock.
+	DIR_CrtTimeTenth = $00	' Creation time, hundreths of a second.
+	DIR_CrtTime = FAT_seconds | (FAT_minutes << 5) | (FAT_hours << 11)	' Creation time.
+	DIR_CrtDate = FAT_day | (FAT_month << 5) | (FAT_year << 9)	' Creation date
+	DIR_LstAccDate = DIR_CrtDate	' Last access date.
+	DIR_WrtTime = DIR_CrtTime	' Last modified time.
+	DIR_WrtDate = DIR_CrtDate	' Last modified date.
+	' Save the information in the file structure.
+	FILE_size = DIR_FileSize
+	FILE_time = DIR_CrtTime
+	FILE_date = DIR_CrtDate
+	FILE_attributes = DIR_Attr
+	FILE_entry = FAT_fHandle
+	' Write the entry to the directory.
+	Gosub Write_File_Entry	' Write directory entry Word FAT_fHandle.  Returns Byte FAT_status.
+	If (FAT_status != TRUE) Then
+		FAT_error = CE_WRITE_ERROR
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to create a file
+'  Returns Byte FAT_error
+CreateFileEntry:
+	FAT_fHandle = 0
+	Gosub FindEmptyEntries	' Starting with Word FAT_fHandle.  Returns Byte FAT_status.
+	If (FAT_status) Then
+		' Store the file's data in the entry.
+		Gosub PopulateEntries	' Entry is Word FAT_fHandle.  Returns Byte FAT_error.
+		If (FAT_error = CE_GOOD) Then
+			' Allocate a cluster to the file.
+			Gosub CreateFirstCluster	' Returns Byte FAT_error.
+		Endif
+	Else
+		FAT_error = CE_DIR_FULL
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to erase a cluster chain - part of the deleting file process
+'  Word FAT_cluster is first cluster in the chain
+'  Returns Byte FAT_status
+FAT_erase_cluster_chain:
+	FAT_status = TRUE
+	' Valid cluster numbers start at 2.
+	If ((FAT_cluster = 0) || (FAT_cluster = 1)) Then
+		Return		' Return TRUE Byte FAT_status.
+	Endif
+	FAT_a = TRUE		' Borrow a to avoid the enum.
+	While (FAT_a = TRUE)
+		' Get the FAT entry for the passed cluster number.
+		FAT_ccls = FAT_cluster
+		Gosub FATread	' Reads cluster Word FAT_ccls.  Returns Word FAT_c.
+		If (FAT_c = CLUSTER_FAIL) Then
+			FAT_status = FALSE
+			Return	' Return FALSE Byte FAT_status.
+		Endif
+		' Valid cluster numbers start at 2.
+		If ((FAT_c = 0) || (FAT_c = 1)) Then
+			Return	' Return TRUE Byte FAT_status.
+		Endif
+		If (FAT_c >= LAST_CLUSTER) Then
+			' The cluster is the last one in the chain.
+			FAT_a = FALSE	' Will exit While after next (last) write
+		Endif
+		' Set the next cluster to the value read from the FAT entry for the next time around.
+		FAT_cluster = FAT_c
+		' Erase cluster FAT_ccls still set from FATread above.
+		FAT_v = CLUSTER_EMPTY
+		Gosub FATwrite	' Write Word FAT_v to cluster Word FAT_ccls.  Returns Word FAT_c.
+		If (FAT_c = CLUSTER_FAIL) Then
+			FAT_status = FALSE
+			Return	' Return FALSE Byte FAT_status.
+		Endif
+	Wend
+	Return			' Return TRUE Byte FAT_status.
+
+
+' Subroutine to erase a file's directory entry and FAT cluster chain
+'  File is pointed to in directory by Word FAT_fHandle
+'  Returns Byte FAT_error
+FILEerase:
+	' Set the directory's current cluster number to the directory's first cluster.
+	FILE_dirccls = FILE_dirclus
+	' Read the sector containing the entry to erase.
+	FAT_ForceRead = TRUE
+	Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+	If (FAT_status = FALSE) Then
+		FAT_error = CE_BADCACHEREAD
+		Return		' Return Byte FAT_error.
+	Endif
+	' Was a non-empty, non-deleted entry returned?
+	FAT_a = DIR_Name[0]
+	If ((FAT_a = DIR_EMPTY) || (FAT_a = DIR_DEL)) Then
+		FAT_error = CE_FILE_NOT_FOUND
+		Return		' Return Byte FAT_error.
+	Endif
+	' Mark the entry as deleted.
+	DIR_Name[0] = DIR_DEL
+	' Write the revised directory entry to delete the file.
+	Gosub Write_File_Entry	' Write directory entry Word FAT_fHandle.  Returns Byte FAT_status.
+	If (FAT_status = FALSE) Then
+		FAT_error = CE_ERASE_FAIL
+		Return		' Return Byte FAT_error.
+	Endif
+	If (DIR_FstClusLO != 0) Then
+		' Erase the FAT entries for the file's clusters.
+		FAT_cluster = DIR_FstClusLO
+		Gosub FAT_erase_cluster_chain	' Starts with Word FAT_Cluster.  Returns Byte FAT_status.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_ERASE_FAIL
+			Return		' Return Byte FAT_error.
+		Endif
+	Endif
+	FAT_error = CE_GOOD
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to open a file for reading or writing
+'  File is pointed to in directory by Word FAT_fHandle
+'  Byte FAT_mode is read or write
+'  Returns Byte FAT_error
+FILEopen:
+	FAT_error = CE_GOOD
+	' Set the directory's current cluster number to the directory's first cluster.
+	FILE_dirccls = FILE_dirclus
+	' Get the file's directory entry and store the directory's sector
+	' in the dsk->buffer member of the file structure (fo).
+	If ((FAT_fHandle = 0) || ((FAT_fHandle & $0f) != 0)) Then
+		FAT_ForceRead = TRUE
+		Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_BADCACHEREAD
+			Return	' Return Byte FAT_error.
+		Endif
+	Endif
+	' Fill the file structure with information from the directory entry.
+	Gosub Fill_File_Object	' Get file information for Word FAT_fHandle.  Returns Byte FAT_status.
+	If (FAT_status != FOUND) Then
+		FAT_error = CE_FILE_NOT_FOUND
+		Return		' Return Byte FAT_error.
+	Endif
+	' A file was found.
+	' Initialize FILE structure members.
+	FILE_seek = 0		' Byte offset in the file.
+	FILE_ccls = FILE_cluster	' The current cluster = the file's first cluster.
+	FILE_sec = 0		' The sector in the cluster.
+	FILE_pos = 0		' The byte in the sector.
+	' Determine the LBA of the file's current cluster.
+	FAT_cluster = FILE_ccls
+	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+	' Read the cluster's first sector into the DISK structure's buffer member.
+	SDC_sector_addr = FAT_sector
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_BAD_SECTOR_READ
+		Return
+	Endif
+	' Set the FILE structure's flags.
+	FILE_Flags_FileWriteEOF = FALSE
+	If ((FAT_mode = "w") || (FAT_mode = "W") || (FAT_mode = "a") || (FAT_mode = "A")) Then
+		' Open the file for writing or appending.
+		FILE_Flags_write = 1
+	Else
+		' Open the file for reading.
+		FILE_Flags_write = 0
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to find first file in the directory
+'  Returns Byte FAT_fHandle, Byte array FAT_FileName and Byte FAT_error
+FINDfirst:
+	' Start at the root directory.
+	FILE_dirclus = 0
+	FAT_fHandle = -1	' FINDnext will bump to 0
+	' Fall through to FINDnext.
+
+
+' Subroutine to find next file in the directory
+'  Byte FAT_fHandle + 1 is next entry to try
+'  Returns Byte FAT_fHandle, Byte array FAT_FileName and Byte FAT_error
+FINDnext:
+	' Set the destination FILE structure's current cluster to the directory's cluster.
+	FILE_dirccls = FILE_dirclus
+	' Call Cache_File_entry with FAT_ForceRead parameter = TRUE the first time
+	' to read the directory's sector from the media into DISK_buffer.
+	' FAT_fHandle contains the number of the entry to read in the directory.
+	FAT_ForceRead = TRUE
+	' Read entries until finding a file or the end of the directory.
+	While (1)
+		' Increment the number of the entry in the directory and try the next one.
+		FAT_fHandle = FAT_fHandle + 1	' Point to next (or first) entry.
+		' Read a directory entry.
+		Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+		FAT_ForceRead = FALSE	' Every time but first time is FALSE.
+		FAT_a = DIR_Name[0]
+		If ((FAT_status = FALSE) || (FAT_a = DIR_EMPTY)) Then
+			FAT_error = CE_FILE_NOT_FOUND
+			Return	' Return Byte FAT_error.
+		Endif
+		If (FAT_a != DIR_DEL) Then
+			' An entry was found.  Read the attributes.
+			FAT_a = DIR_Attr & ATTR_MASK
+			' If the entry is for a volume ID or hidden file, skip it.
+			If ((FAT_a != ATTR_VOLUME) && (FAT_a != ATTR_LONG_NAME) && ((FAT_a & ATTR_HIDDEN) != ATTR_HIDDEN)) Then
+				For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+					FAT_FileName[FAT_i] = DIR_Name[FAT_i]
+				Next FAT_i
+				FAT_error = CE_GOOD
+				Return	' Return Byte FAT_error.
+			Endif
+		Endif
+	Wend
+'	Return			' Can't get here.
+
+
+' Subroutine to set up a newly inserted card
+'  Returns Byte FAT_error
+FSInit:
+	Goto DISKmount		' Initializes media and reads boot sectors.  Returns Byte FAT_error.
+
+
+' Subroutine to make card ready to remove
+'  Make sure any open file is closed before calling this subroutine
+FSExit:
+	Gosub ShutdownMedia
+	DISK_mount = FALSE
+	Return
+
+' Subroutine to open a file for reading or writing
+'  Byte array FileNname is name to match
+'  Byte FAT_mode is READ ("r"), WRITE ("w") or APPEND ("a")
+'  Returns Byte FAT_error
+FSfopen:
+	If (DISK_mount = FALSE) Then
+		FAT_error = CE_NOT_INIT	' The media isn't available.
+		Return
+	Endif
+	If ((FAT_mode = "w") || (FAT_mode = "W") || (FAT_mode = "a") || (FAT_mode = "A")) Then
+		' If the card is write protected then we can't open it for write or append.
+		If (SD_WE) Then
+			FAT_error = CE_WRITE_PROTECTED
+			Return	' Return Byte FAT_error.
+		Endif
+	Endif
+	FILE_cluster = 0
+	FILE_ccls = 0
+	FILE_entry = 0
+	' Start at the root directory.
+	FILE_dirclus = 0
+'	FILE_dirccls = 0
+	' Try to find the file.
+	Gosub FILEfind		' Find file matching Byte array FAT_FileName.  Returns Byte FAT_error.
+	If (FAT_error = CE_GOOD) Then
+		' File is found.
+		Select Case FAT_mode
+			Case "W", "w"
+FSfopenw:
+				' File exists, we want to create a new one, remove it first.
+				FAT_fHandle = FILE_entry
+				Gosub FILEerase	' Erase file pointed to by Word FAT_fHandle.  Returns Byte FAT_error.
+				If (FAT_error != CE_GOOD) Then
+					Return	' Return Byte FAT_error.
+				Endif
+				' Now create a new one.
+				Gosub CreateFileEntry	' Returns Byte FAT_error.
+				If (FAT_error != CE_GOOD) Then
+					Return	' Return Byte FAT_error.
+				Endif
+				Gosub FILEopen	' File pointed to by Word FAT_fHandle, Byte FAT_mode is READ, WRITE or APPEND.  Returns Byte FAT_error.
+				If (FAT_error != CE_GOOD) Then
+					Return	' Return Byte FAT_error.
+				Endif
+				If (File_attributes & ATTR_DIRECTORY) Then
+					FAT_error = CE_INVALID_ARGUMENT
+					Return	' Return Byte FAT_error.
+				Endif
+'				FAT_offset = 0
+'				Gosub FSfseek	' Seek to Long FAT_offset.  Returns Byte FAT_error.
+			Case "A", "a"
+				If (FILE_size = 0) Then Goto FSfopenw	' Appending to front, pretend its a write.
+				FAT_fHandle = FILE_entry
+				Gosub FILEopen	' File pointed to by Word FAT_fHandle, Byte FAT_mode is READ, WRITE or APPEND.  Returns Byte FAT_error.
+				If (FAT_error != CE_GOOD) Then
+					Return	' Return Byte FAT_error.
+				Endif
+				If (File_attributes & ATTR_DIRECTORY) Then
+					FAT_error = CE_INVALID_ARGUMENT
+					Return	' Return Byte FAT_error.
+				Endif
+				FAT_offset = FILE_size	' Append to end of file.
+				Gosub FSfseek	' Seek to Long FAT_offset.  Returns Byte FAT_error.
+'			Case "R", "r"
+			Case Else	' Default to READ.
+				FAT_fHandle = FILE_entry
+				Gosub FILEopen	' File pointed to by Word FAT_fHandle, Byte FAT_mode is READ, WRITE or APPEND.  Returns Byte FAT_error.
+				If (File_attributes & ATTR_DIRECTORY) Then
+					FAT_error = CE_INVALID_ARGUMENT
+					Return	' Return Byte FAT_error.
+				Endif
+			End Select
+	Else
+		' File is not found.
+		If ((FAT_mode = "w") || (FAT_mode = "W") || (FAT_mode = "a") || (FAT_mode = "A")) Then
+			' Now create a new one.
+			Gosub CreateFileEntry	' Returns Byte FAT_error.
+			If (FAT_error != CE_GOOD) Then
+				Return	' Return Byte FAT_error.
+			Endif
+			Gosub FILEopen	' File pointed to by Word FAT_fHandle, Byte FAT_mode is READ, WRITE or APPEND.  Returns Byte FAT_error.
+			If (FAT_error != CE_GOOD) Then
+				Return	' Return Byte FAT_error.
+			Endif
+			If (File_attributes & ATTR_DIRECTORY) Then
+				FAT_error = CE_INVALID_ARGUMENT
+				Return	' Return Byte FAT_error.
+			Endif
+'			FAT_offset = 0
+'			Gosub FSfseek	' Seek to Long FAT_offset.  Returns Byte FAT_error.
+		Else
+			FAT_error = CE_FILE_NOT_FOUND
+		Endif
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to close a file after writing or appending
+'  Returns Byte FAT_error
+FSfclose:
+	FAT_error = CE_GOOD
+	' Nothing to do if the file wasn't opened for writing.
+	If (FILE_Flags_write) Then
+		' Set FAT_fHandle to the numer of the file's entry in its directory.
+		FAT_fHandle = FILE_entry
+		' Get the file's attributes.
+		Gosub LoadDirAttrib	' File entry is Word FAT_fHandle.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_BADCACHEREAD
+		Endif
+		' Update the time and date.
+		DIR_WrtTime = FAT_seconds | (FAT_minutes << 5) | (FAT_hours << 11)	' Write time.
+		DIR_WrtDate = FAT_day | (FAT_month << 5) | (FAT_year << 9)	' Write date.
+		' Set DIR_FileSize to the file's size.
+		DIR_FileSize = FILE_size
+		DIR_Attr = FILE_attributes
+		' Write the file's entry in its directory.
+		Gosub Write_File_Entry	' Write directory entry Word FAT_fHandle.  Returns Byte FAT_status.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_WRITE_ERROR
+		Endif
+		' The file is no longer open for writing.
+		FILE_Flags_write = 0
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to read data from a file into a buffer
+'  Word FAT_count is byte count
+'  Returns Byte FAT_error, Word FAT_rwCount and Byte array FAT_dest
+FSfread:
+	FAT_error = CE_GOOD
+	FAT_rwCount = 0
+	' Save the offset to begin reading from within the current sector,
+	' the offset to read from within the file, and the file's size.
+	FAT_pos = FILE_pos
+	FAT_seek = FILE_seek
+	' Get the sector number of the file's current cluster.
+'	FAT_cluster = FILE_ccls
+'	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector
+	' Add the number of the current sector within the cluster.
+'	SDC_sector_addr = FAT_sector + FILE_sec
+	' Read the sector's data
+'	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+'	If (SDC_status != sdcValid) Then
+'		FAT_error = CE_BAD_SECTOR_READ
+'	Endif
+	While ((FAT_error = CE_GOOD) && (FAT_count > 0))
+		If (FAT_seek >= FILE_size) Then
+			' It's the end of file
+			FAT_error = CE_EOF
+		Else
+			' If we've reached the end of the sector, load another sector.
+			If (FAT_pos >= MEDIA_SECTOR_SIZE) Then
+				' Reset the offset within the sector.
+				FAT_pos = 0
+				' Increment the sector number.
+				FILE_sec = FILE_sec + 1
+				' The sector number (sec), should be a value between 0 and SecPerClus - 1.
+				' If sec = SecPerClus, the sector is the first sector in a new cluster.
+				If (FILE_sec >= DISK_SecPerClus) Then
+					' Get the next cluster in the file and start in the cluster's first sector.
+					FILE_sec = 0
+					Gosub FILEget_next_cluster	' Reads and returns cluster Word FILE_ccls.  Returns Byte FAT_error.
+				Endif
+				If (FAT_error = CE_GOOD) Then
+					' Get the sector number of the current cluster, which may have changed.
+					FAT_cluster = FILE_ccls
+					Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector
+					' Add the number of the current sector within the cluster.
+					SDC_sector_addr = FAT_sector + FILE_sec
+					' Read the sectors data.
+					Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+					If (SDC_status != sdcValid) Then
+						FAT_error = CE_BAD_SECTOR_READ
+					Endif
+				Endif
+			Endif
+			If (FAT_error = CE_GOOD) Then
+				' A sector's data is in the DISK structure's buffer member.
+				' Copy a byte from the specified offset (FAT_pos) in the DISK structure's buffer
+				' to the dest buffer.
+				If (FAT_rwCount < FAT_BUFFER_SIZE) Then
+					FAT_dest[FAT_rwCount] = DISK_buffer[FAT_pos]
+					FAT_rwCount = FAT_rwCount + 1
+				Endif
+				FAT_pos = FAT_pos + 1
+				FAT_seek = FAT_seek + 1
+				FAT_count = FAT_count - 1
+			Endif
+		Endif		' End: if not end of file.
+	Wend			' While no error and no more bytes to copy.
+	' Save the offset within the sector.
+	FILE_pos = FAT_pos
+	' Save the offset within the file.
+	FILE_seek = FAT_seek
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to write data from a buffer into a file
+'  Byte array FAT_src is the source buffer
+'  Word FAT_count is byte count
+'  Returns Byte FAT_error
+FSfwrite:
+	FAT_error = CE_GOOD
+	FAT_rwCount = 0
+	' See if the file was opened in a write mode.
+	If (!FILE_Flags_write) Then
+		FAT_error = CE_WRITE_ERROR
+		Return		' Return Byte FAT_error.
+	Endif
+	' If the card is write protected then we shouldn't write to it.
+	If (SD_WE) Then
+		FAT_error = CE_WRITE_PROTECTED
+		Return		' Return Byte FAT_error.
+	Endif
+	If FAT_count = 0 Then Return
+	' It's OK to write to the media.
+	' Save the offset within the current sector and the absolute offset in the file.
+	FAT_pos = FILE_pos
+	FAT_seek = FILE_seek
+	' Get the sector number of the file's current cluster.
+	FAT_cluster = FILE_ccls
+	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+	' Add the number of the current sector within the cluster.
+	SDC_sector_addr = FAT_sector + FILE_sec
+	' Read the sector.
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_BAD_SECTOR_READ
+	Endif
+	' Save the file's size.
+	FAT_size = FILE_size
+	' Write to the file until finished or an error.
+	While ((FAT_error = CE_GOOD) && (FAT_count > 0))
+		If (FAT_seek >= FAT_size) Then
+			' It's the end of the file.  Set the flag.
+			FILE_Flags_FileWriteEOF = TRUE
+		Endif
+		' If we've reached the end of a sector, write the data to the media and
+		' load another sector.
+		If (FAT_pos >= MEDIA_SECTOR_SIZE) Then
+			' The DISK buffer contains data to be written.
+			' Copy the data to the storage media.
+			Gosub SectorWrite	' Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+			If (SDC_status != sdcValid) Then
+				FAT_error = CE_WRITE_ERROR
+			Endif
+			' Reset the offset within the sector.
+			FAT_pos = 0
+			' Increment the sector number.
+			FILE_sec = FILE_sec + 1
+			' The sector number (sec) must have a value between 0 and SecPerClus - 1.
+			' If sec = SecPerClus, the sector is the first sector in a new cluster.
+			If (FILE_sec >= DISK_SecPerClus) Then
+				' Reset the sector number for the new cluster.
+				FILE_sec = 0
+				If (FILE_Flags_FileWriteEOF) Then
+					' It's the end of the file.  Allocate a new cluster for additional data.
+					Gosub FILEallocate_new_cluster	' Returns Byte FAT_error.
+				Else
+					' Not the end of file.  Get the next cluster allocated to the file.
+					Gosub FILEget_next_cluster	' Reads and returns cluster Word FILE_ccls.  Returns Byte FAT_error.
+				Endif
+			Endif
+			If (FAT_error = CE_DISK_FULL) Then
+				Return	' Return Byte FAT_error.
+			Endif
+			If (FAT_error = CE_GOOD) Then
+				' Read the next sector from the media.
+				' Get the sector number of the file's current cluster.
+				FAT_cluster = FILE_ccls
+				Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+				' Add the number of the current sector within the cluster.
+				SDC_sector_addr = FAT_sector + FILE_sec
+				' Read the new sector's data.
+				Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+				If (SDC_status != sdcValid) Then
+					FAT_error = CE_BAD_SECTOR_READ
+				Endif
+			Endif
+		Endif
+		If (FAT_error = CE_GOOD) Then
+			' A sector's data is in the DISK buffer.
+			' Copy a byte from the passed buffer (FAT_src) to the
+			' specified offset (FAT_pos) in the DISK buffer.
+			If (FAT_rwCount < FAT_BUFFER_SIZE) Then
+				DISK_buffer[FAT_pos] = FAT_src[FAT_rwCount]
+				' Increment the offset of the byte to write.
+				FAT_rwCount = FAT_rwCount + 1
+			Endif
+			FAT_pos = FAT_pos + 1
+			' Increment the offset of the byte within the file.
+			FAT_seek = FAT_seek + 1
+			' Decrement the number of bytes remaining to write.
+			FAT_count = FAT_count - 1
+		Endif
+		If (FILE_Flags_FileWriteEOF) Then
+			' The data was appended to the file, so increment the file size.
+			FAT_size = FAT_size + 1
+		Endif
+	Wend
+	' If no error, write the final sector's data to the media.
+	If (FAT_error = CE_GOOD) Then
+		' Get the sector number of the file's current cluster.
+		FAT_cluster = FILE_ccls
+		Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+		' Add the number of the current sector within the cluster.
+		SDC_sector_addr = FAT_sector + FILE_sec
+		' Copy the data from the DISK buffer to the storage media.
+		Gosub SectorWrite	' Long SDC_sector_addr is the sector to write.  Returns Byte SDC_status.
+		If (SDC_status != sdcValid) Then
+			FAT_error = CE_WRITE_ERROR
+		Endif
+	Endif
+	' Save the position within the current sector, the byte number within the file,
+	' and the file size.
+	FILE_pos = FAT_pos
+	FILE_seek = FAT_seek
+	FILE_size = FAT_size
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to delete a file
+'  Byte array FAT_FileName is file to delete
+'  Returns Byte FAT_error
+FSremove:
+	If (DISK_mount = FALSE) Then
+		FAT_error = CE_NOT_INIT	' The media isn't available.
+		Return
+	Endif
+	' If the card is write protected then we shouldn't do the erase.
+	If (SD_WE) Then
+		FAT_error = CE_WRITE_PROTECTED
+		Return		' Return Byte FAT_error.
+	Endif
+'	FILE_cluster = 0
+'	FILE_ccls = 0
+	FILE_entry = 0
+	' Start at the root directory.
+	FILE_dirclus = 0
+'	FILE_dirccls = 0
+	' Try to find the file.
+	Gosub FILEfind		' Find file matching Byte array FAT_FileName.  Returns Byte FAT_error.
+	If (FAT_error != CE_GOOD) Then
+		Return		' Return Byte FAT_error.
+	Endif
+	FAT_ForceRead = TRUE
+	Gosub Cache_File_Entry	' Get directory entry for Word FAT_fHandle using Byte FAT_ForceRead.  Returns Byte FAT_status.
+	If (FAT_status = FALSE) Then
+		FAT_error = CE_BADCACHEREAD
+		Return	' Return Byte FAT_error.
+	Endif
+	If (DIR_Attr & ATTR_DIRECTORY) Then
+		FAT_error = CE_INVALID_ARGUMENT
+		Return	' Return Byte FAT_error.
+	Endif
+	' If file found then erase it.
+	FAT_fHandle = FILE_entry
+	Gosub FILEerase	' Erase file pointed to by Word FAT_fHandle.  Returns Byte FAT_error.
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to rename a file
+'  Byte array FAT_FileName is file to rename, Byte array FAT_FileName is new name
+'  Returns Byte FAT_error
+FSrename:
+	If (DISK_mount = FALSE) Then
+		FAT_error = CE_NOT_INIT	' The media isn't available.
+		Return
+	Endif
+	' If the card is write protected then we shouldn't do the erase.
+	If (SD_WE) Then
+		FAT_error = CE_WRITE_PROTECTED
+		Return		' Return Byte FAT_error.
+	Endif
+'	FILE_cluster = 0
+'	FILE_ccls = 0
+	FILE_entry = 0
+	' Start at the root directory.
+	FILE_dirclus = 0
+'	FILE_dirccls = 0
+	' Save current filename.
+	For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+		FAT_FileName1[FAT_i] = FAT_FileName[FAT_i]
+	Next FAT_i
+	' Set filename for new file.
+	For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+		FAT_FileName[FAT_i] = FAT_FileName2[FAT_i]
+	Next FAT_i
+	' Try to find a file with the new name.
+	Gosub FILEfind		' Find file matching Byte array FAT_FileName.  Returns Byte FAT_error.
+	If (FAT_error = CE_GOOD) Then	' If file found that already has new name then can't do rename.
+		FAT_error = CE_FILENAME_EXISTS
+		Return
+	Endif
+	FILE_entry = 0
+	' Start at the root directory.
+	FILE_dirclus = 0
+'	FILE_dirccls = 0
+	' Set filename for back to current file.
+	For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+		FAT_FileName[FAT_i] = FAT_FileName1[FAT_i]
+	Next FAT_i
+	' Try to find the current file.
+	Gosub FILEfind		' Find file matching Byte array FAT_FileName.  Returns Byte FAT_error.
+	If (FAT_error = CE_GOOD) Then	' If file found then do the rename.
+		' Set FAT_fHandle to the numer of the file's entry in its directory.
+		FAT_fHandle = FILE_entry
+		' Get the file's attributes.
+		Gosub LoadDirAttrib	' File entry is Word FAT_fHandle.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_WRITE_ERROR
+		Endif
+		' Set directory name to new file name.
+		For FAT_i = 0 To (FILE_NAME_SIZE - 1)
+			DIR_Name[FAT_i] = FAT_FileName2[FAT_i]
+		Next FAT_i
+		' Write the file's entry in its directory.
+		Gosub Write_File_Entry	' Write directory entry Word FAT_fHandle.  Returns Byte FAT_status.
+		If (FAT_status = FALSE) Then
+			FAT_error = CE_WRITE_ERROR
+		Endif
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to indicate if at end of file
+'  Returns Byte FAT_status
+FSfeof:
+	FAT_status = FALSE	' Start with not at end of file
+	If (FILE_seek >= FILE_size) Then
+		FAT_status = TRUE	' At end of file
+	Endif
+	Return
+
+
+' Subroutine to point the currently open file to the begining of file
+FSrewind:
+	FILE_seek = 0
+	FILE_pos = 0
+	FILE_sec = 0
+	FILE_ccls = FILE_cluster
+	Return
+
+
+' Subroutine to seek to a specific position in a file
+'  Long FAT_offset is position to seek to
+'  Returns Byte FAT_error
+FSfseek:
+	' Check to see if we are past the end of the file.
+	If (FAT_offset > FILE_size) Then
+		FAT_error = CE_INVALID_ARGUMENT
+		Return		' Return Byte FAT_error.
+	Endif
+	' Start at the beginning of the file.
+	FILE_ccls = FILE_cluster
+	' If we are writing, we are no longer at the end.
+	FILE_Flags_FileWriteEOF = FALSE
+	' Set new position.
+	FILE_seek = FAT_offset
+	' Figure out which sector.
+	FAT_sector = FAT_offset / MEDIA_SECTOR_SIZE
+	' Figure out the position in the sector.
+	FILE_pos = FAT_offset - (FAT_sector * MEDIA_SECTOR_SIZE)
+	' Figure out which cluster.
+	FAT_n = FAT_sector / DISK_SecPerClus
+	' Figure out the stranded sectors.
+	FILE_sec = FAT_sector - (FAT_n * DISK_SecPerClus)
+	' If not the current cluster, get the proper one.
+	While (FAT_n > 0)
+		Gosub FILEget_next_cluster	' Reads and returns cluster Word FILE_ccls.  Returns Byte FAT_error.
+		If (FAT_error != CE_GOOD) Then
+			If (FAT_error = CE_FAT_EOF) Then
+				If (FILE_Flags_write) Then
+					Gosub FILEallocate_new_cluster	' Returns Byte FAT_error.
+					If (FAT_error != CE_GOOD) Then
+						FAT_error = CE_COULD_NOT_GET_CLUSTER
+						Return
+					Endif
+				Else
+					FILE_pos = MEDIA_SECTOR_SIZE	' Point to end of last cluster
+					FILE_sec = DISK_SecPerClus - 1
+				Endif
+			Else
+				' Past the limits.
+				FAT_error = CE_COULD_NOT_GET_CLUSTER
+				Return	' Return Byte FAT_error.
+			Endif
+		Endif
+		FAT_n = FAT_n - 1
+	Wend
+	' Determine the LBA of the selected sector and load it.
+	FAT_cluster = FILE_ccls
+	Gosub Cluster2Sector	' Convert Word FAT_cluster to Long FAT_sector.
+	' Now the extra sectors.
+	SDC_sector_addr = FAT_sector + FILE_sec
+	Gosub SectorRead	' Long SDC_sector_addr is the sector to read.  Returns Byte SDC_status.
+	If (SDC_status != sdcValid) Then
+		FAT_error = CE_BAD_SECTOR_READ
+	Else
+		FAT_error = CE_GOOD
+	Endif
+	Return			' Return Byte FAT_error.
+
+
+' Subroutine to return current location in file
+'  Returns Long FAT_seek
+FSftell:
+	FAT_seek = FILE_seek
+	Return
+
+
+' Label at end of SD/MMC/FAT subroutines
+SkipSD:
